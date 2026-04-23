@@ -143,6 +143,94 @@ def _bgr_to_jpeg_b64(bgr, quality=85):
     return base64.b64encode(buf.tobytes()).decode("ascii")
 
 
+def _round_timing(t):
+    """타이밍 딕셔너리를 표시용으로 반올림."""
+    out = {}
+    for k, v in t.items():
+        if v is None:
+            out[k] = None
+        elif isinstance(v, int):
+            out[k] = v
+        elif "delta" in k:
+            out[k] = round(v, 3)
+        else:
+            out[k] = round(v, 2)
+    return out
+
+
+def _drain_queue(cap, max_drops=10, quick_ms=30):
+    """V4L2 내부 큐에 쌓인 오래된 프레임들을 비운다.
+
+    grab()이 빠르게 반환되면 큐에 남아있던 버퍼가 회수된 것으로 판단해
+    계속 drain, 길어지면 센서가 다음 프레임을 만드는 중(=큐가 비었음)으로
+    판단해 중단한다. 트리거 모드/continuous 모드 모두 안전.
+
+    Returns:
+        drain된 프레임 수.
+    """
+    drops = 0
+    for _ in range(max_drops):
+        t0 = time.monotonic()
+        ok = cap.grab()
+        dt = (time.monotonic() - t0) * 1000
+        if not ok:
+            break
+        drops += 1
+        if dt > quick_ms:
+            break
+    return drops
+
+
+def _parallel_drain(caps, cam_ids, max_drops=10, quick_ms=30):
+    """여러 카메라의 큐를 병렬로 drain."""
+    results = {}
+
+    def _d(dev):
+        results[dev] = _drain_queue(caps[dev], max_drops, quick_ms)
+
+    threads = [threading.Thread(target=_d, args=(d,)) for d in cam_ids]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+    return results
+
+
+def _all_open_ar0234_devs():
+    """트리거가 활성화된 열린 AR0234 카메라 dev 번호 리스트."""
+    return [d for d, info in state._cap_info.items()
+            if info["type"] == "ar0234" and info.get("trigger")]
+
+
+def _sync_pulse_grab_ar0234():
+    """GPIO 펄스 + 열린 모든 AR0234 카메라 병렬 grab.
+
+    GPIO는 하드웨어 공유 라인이라 한 번의 펄스가 트리거 활성화된 모든
+    AR0234 카메라의 V4L2 큐에 프레임을 추가한다. 타겟 외 카메라 큐가
+    누적되는 것을 막기 위해, 매 펄스마다 모든 AR0234 카메라를 동시에
+    grab하여 큐 상태를 동기화 유지한다. retrieve는 호출자가 타겟에
+    대해서만 수행한다.
+
+    Returns:
+        (grabs, pulse_ms, grab_ms) — grabs는 parallel_grab과 동일한 형식
+        {dev: {"ok": bool, "grab_ms": float}}.
+    """
+    all_ar0234 = _all_open_ar0234_devs()
+    all_caps = {d: state._open_caps[d] for d in all_ar0234}
+
+    t_pulse = time.monotonic()
+    gpio_pulse()
+    pulse_ms = (time.monotonic() - t_pulse) * 1000
+
+    if not all_caps:
+        return {}, pulse_ms, 0.0
+
+    t_grab = time.monotonic()
+    grabs = parallel_grab(all_caps, all_ar0234)
+    grab_ms = (time.monotonic() - t_grab) * 1000
+    return grabs, pulse_ms, grab_ms
+
+
 def _release_caps():
     """열려 있는 모든 카메라 세션을 해제한다."""
     for dev, cap in state._open_caps.items():
@@ -170,7 +258,17 @@ def _ensure_cap_open(dev_num, cam_type):
     # trigger_mode 상태를 카메라 열기 전에 확인 (열고 나면 리셋됨)
     is_trigger = (cam_type == "ar0234") and check_trigger_mode(dev_num)
 
+    # Tegra 카메라 드라이버: override_enable=1 이어야 사용자가 v4l2로 쓴
+    # exposure / analogue_gain 값이 sensor_mode 프리셋을 덮어쓰며 실제 센서
+    # 레지스터에 적용된다. STREAMON 이후엔 반영이 보장되지 않으므로
+    # VideoCapture 열기 전에 설정.
+    if cam_type == "ar0234":
+        v4l2_set(dev_num, "override_enable", 1)
+
     cap = cv2.VideoCapture(dev_num, cv2.CAP_V4L2)
+    # V4L2 DMA 버퍼 링을 최소화 — stale frame lag 방지.
+    # REQBUFS 이전에 호출되어야 반영되므로 fourcc/size 설정보다 먼저 둔다.
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     if cam_type == "ar0234":
         cap.set(cv2.CAP_PROP_FOURCC, V4L2_BA10)
         cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
@@ -180,12 +278,36 @@ def _ensure_cap_open(dev_num, cam_type):
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # 워밍업 (파이프라인 활성화)
-    for _ in range(3):
-        if is_trigger:
-            gpio_pulse()
+    # 워밍업: sync_monitor 패턴(초기 펄스+grab 1회 + 5회 루프).
+    # 트리거 펄스는 하드웨어 공유 라인이라 기존에 열린 AR0234 카메라의
+    # 큐에도 프레임을 추가하므로, 해당 카메라들도 같이 grab해서 누적을
+    # 방지한다 (큐 동기화 불변).
+    other_caps = [state._open_caps[d] for d in _all_open_ar0234_devs()]
+
+    if cam_type == "ar0234" and is_trigger:
+        gpio_pulse(duration_ms=1)
         cap.grab()
-        cap.retrieve()
+        for c in other_caps:
+            try:
+                c.grab()
+            except Exception:
+                pass
+
+        for _ in range(5):
+            gpio_pulse()
+            cap.grab()
+            cap.retrieve()
+            for c in other_caps:
+                try:
+                    c.grab()
+                except Exception:
+                    pass
+            time.sleep(0.02)
+    else:
+        # 비트리거 AR0234 / USB: 단순 워밍업
+        for _ in range(3):
+            cap.grab()
+            cap.retrieve()
 
     state._open_caps[dev_num] = cap
     state._cap_info[dev_num] = {
@@ -201,31 +323,56 @@ def capture_single(dev_num, cam_type):
 
     카메라 세션을 유지한 채 grab/retrieve만 호출하여
     trigger_mode 리셋을 방지한다.
+
+    Returns:
+        (bgr, timing) 튜플. 실패 시 (None, timing).
+        timing dict: pulse_ms, grab_ms, retrieve_ms, isp_ms.
     """
     cap, actual_w, actual_h, is_trigger = _ensure_cap_open(dev_num, cam_type)
+    timing = {"pulse_ms": 0.0, "grab_ms": 0.0,
+              "retrieve_ms": 0.0, "isp_ms": 0.0,
+              "drain_ms": 0.0, "drained": 0}
+
+    # 큐에 쌓인 stale 프레임 제거 — 항상 최신 프레임이 나오도록
+    t0 = time.monotonic()
+    timing["drained"] = _drain_queue(cap)
+    timing["drain_ms"] = (time.monotonic() - t0) * 1000
 
     if is_trigger:
-        gpio_pulse()
-    ret = cap.grab()
-    if not ret:
-        return None
-    ret, frame = cap.retrieve()
-    if not ret:
-        return None
+        # 펄스 + 열린 모든 AR0234 병렬 grab (큐 동기화)
+        grabs, pulse_ms, grab_ms = _sync_pulse_grab_ar0234()
+        timing["pulse_ms"] = pulse_ms
+        timing["grab_ms"] = grab_ms
+        if not grabs.get(dev_num, {}).get("ok", False):
+            return None, timing
+    else:
+        t0 = time.monotonic()
+        ret = cap.grab()
+        timing["grab_ms"] = (time.monotonic() - t0) * 1000
+        if not ret:
+            return None, timing
 
+    t0 = time.monotonic()
+    ret, frame = cap.retrieve()
+    timing["retrieve_ms"] = (time.monotonic() - t0) * 1000
+    if not ret:
+        return None, timing
+
+    t0 = time.monotonic()
     if cam_type == "ar0234":
         if state.use_gpu and _cuda_ctx is not None:
             _cuda_ctx.push()
             try:
-                bgr, _ = demosaic_gpu(frame, actual_h, actual_w)
+                bgr, _ = demosaic_gpu(frame, actual_h, actual_w, buf_id=dev_num)
             finally:
                 _cuda_ctx.pop()
         else:
             bgr = demosaic(frame, actual_h, actual_w)
     else:
         bgr = frame
+    timing["isp_ms"] = (time.monotonic() - t0) * 1000
 
-    return bgr
+    return bgr, timing
 
 
 def capture_multi(dev_nums, cam_infos):
@@ -234,12 +381,19 @@ def capture_multi(dev_nums, cam_infos):
     AR0234 카메라는 GPIO 트리거로 동기 촬영하고,
     USB 카메라는 일반 grab/retrieve로 촬영한다.
     카메라 세션을 유지하여 trigger_mode 리셋을 방지한다.
+
+    Returns:
+        (results, error, timing) 튜플. timing dict는 pulse_ms, grab_ms,
+        retrieve_ms, isp_ms, delta_grab_ms(AR0234 2대 이상일 때만 값 있음).
     """
     ar0234_devs = [d for d in dev_nums if cam_infos[d]["type"] == "ar0234"]
     usb_devs = [d for d in dev_nums if cam_infos[d]["type"] == "usb"]
 
     results = {}
     error = None
+    timing = {"pulse_ms": 0.0, "grab_ms": 0.0, "retrieve_ms": 0.0,
+              "isp_ms": 0.0, "delta_grab_ms": None,
+              "drain_ms": 0.0, "drained": 0}
 
     # AR0234 다중 촬영 (GPIO 트리거)
     if ar0234_devs:
@@ -248,21 +402,36 @@ def capture_multi(dev_nums, cam_infos):
             cap, actual_w, actual_h, is_trigger = _ensure_cap_open(dev, "ar0234")
             if not is_trigger:
                 return {}, (f"cam{dev} trigger_mode 비활성. "
-                           "먼저: python3 trigger_mode_ctrl.py on")
+                           "먼저: python3 trigger_mode_ctrl.py on"), timing
             caps[dev] = cap
 
         info = state._cap_info[ar0234_devs[0]]
         actual_w, actual_h = info["w"], info["h"]
 
-        # 본 촬영
-        gpio_pulse()
-        grabs = parallel_grab(caps, ar0234_devs)
+        # 펄스 + 열린 모든 AR0234 병렬 grab (타겟 외 cam이 있어도 큐 sync 유지).
+        # Multi에서도 drain은 하지 않음 — 카메라별 독립 drain은 큐 비대칭을
+        # 만들어 sync를 깬다. 대신 매 pulse마다 모든 AR0234를 동시에 grab해
+        # 큐 상태를 항상 동일하게 맞춘다.
+        grabs, pulse_ms, grab_ms = _sync_pulse_grab_ar0234()
+        timing["pulse_ms"] = pulse_ms
+        timing["grab_ms"] = grab_ms
+
+        # sync delta는 "타겟" 카메라들의 grab 시간으로만 계산
+        target_grab_times = [grabs[d]["grab_ms"] for d in ar0234_devs
+                             if grabs.get(d, {}).get("ok")]
+        if len(target_grab_times) >= 2:
+            timing["delta_grab_ms"] = (max(target_grab_times) -
+                                        min(target_grab_times))
+
+        t0 = time.monotonic()
         raws, errors = parallel_retrieve(caps, ar0234_devs, grabs)
+        timing["retrieve_ms"] = (time.monotonic() - t0) * 1000
         # release 하지 않음 — 세션 유지
 
         if errors:
             error = f"촬영 실패 카메라: {errors}"
 
+        t0 = time.monotonic()
         if state.use_gpu and _cuda_ctx is not None:
             _cuda_ctx.push()
         try:
@@ -277,19 +446,27 @@ def capture_multi(dev_nums, cam_infos):
         finally:
             if state.use_gpu and _cuda_ctx is not None:
                 _cuda_ctx.pop()
+        timing["isp_ms"] = (time.monotonic() - t0) * 1000
 
-    # USB 카메라 촬영
+    # USB 카메라 촬영 (순차 실행 — 타이밍은 grab/retrieve 버킷에 누적)
+    # Multi 모드에서는 drain을 하지 않는다 (AR0234 쪽 주석 참조, 일관성 유지).
     for dev in usb_devs:
         cap, _, _, _ = _ensure_cap_open(dev, "usb")
+        t0 = time.monotonic()
         ret = cap.grab()
+        grab_dt = (time.monotonic() - t0) * 1000
         if ret:
+            t0 = time.monotonic()
             ret, bgr = cap.retrieve()
+            retrieve_dt = (time.monotonic() - t0) * 1000
             if ret:
                 results[dev] = bgr
+                timing["grab_ms"] += grab_dt
+                timing["retrieve_ms"] += retrieve_dt
                 continue
         error = (error or "") + f" cam{dev} USB 촬영 실패."
 
-    return results, error
+    return results, error, timing
 
 
 # ---------------------------------------------------------------------------
@@ -342,13 +519,19 @@ def api_capture():
         if dev not in cam_map:
             return jsonify({"error": f"cam{dev}은 감지되지 않은 카메라입니다."}), 400
 
+    t_total_start = time.monotonic()
+
     if mode == "single":
         dev = devices[0]
-        bgr = capture_single(dev, cam_map[dev]["type"])
+        bgr, timing = capture_single(dev, cam_map[dev]["type"])
         if bgr is None:
             return jsonify({"error": f"cam{dev} 촬영 실패"}), 500
 
+        t0 = time.monotonic()
         jpeg_b64 = _bgr_to_jpeg_b64(bgr)
+        timing["encode_ms"] = (time.monotonic() - t0) * 1000
+        timing["total_ms"] = (time.monotonic() - t_total_start) * 1000
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         h, w = bgr.shape[:2]
 
@@ -364,12 +547,13 @@ def api_capture():
                 "width": w,
                 "height": h,
                 "type": cam_map[dev]["type"],
-            }]
+            }],
+            "timing": _round_timing(timing),
         })
 
     else:  # multi
         cam_infos = {d: cam_map[d] for d in devices}
-        results, error = capture_multi(devices, cam_infos)
+        results, error, timing = capture_multi(devices, cam_infos)
 
         if not results:
             return jsonify({"error": error or "촬영 실패"}), 500
@@ -377,6 +561,7 @@ def api_capture():
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         images = []
 
+        t0 = time.monotonic()
         with state.lock:
             state.captured = {}
             for dev, bgr in results.items():
@@ -392,8 +577,10 @@ def api_capture():
                     "height": h,
                     "type": cam_map[dev]["type"],
                 })
+        timing["encode_ms"] = (time.monotonic() - t0) * 1000
+        timing["total_ms"] = (time.monotonic() - t_total_start) * 1000
 
-        resp = {"images": images}
+        resp = {"images": images, "timing": _round_timing(timing)}
         if error:
             resp["warning"] = error
         return jsonify(resp)
@@ -422,6 +609,14 @@ def api_save():
         saved_files.append(filepath)
 
     return jsonify({"saved": saved_files})
+
+
+@app.route("/api/clear", methods=["POST"])
+def api_clear():
+    """미리보기 및 저장 대상 캡처 데이터를 초기화한다."""
+    with state.lock:
+        state.captured = {}
+    return jsonify({"status": "cleared"})
 
 
 @app.route("/api/close", methods=["POST"])
@@ -475,6 +670,11 @@ def api_params_set():
         return jsonify({"error": "dev 필요"}), 400
 
     changed = []
+    # Tegra 드라이버: override_enable=1 이어야 exposure/gain이 센서에 반영됨.
+    # _ensure_cap_open에서 이미 켜지만, 세션 재오픈/드라이버 리셋 케이스를
+    # 위해 매번 방어적으로 재적용 (idempotent).
+    if "exposure" in data or "analogue_gain" in data:
+        v4l2_set(dev, "override_enable", 1)
     if "exposure" in data:
         v4l2_set(dev, "exposure", data["exposure"])
         changed.append("exposure")
@@ -497,7 +697,10 @@ HTML_TEMPLATE = """
 <title>Camera Test GUI</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: #1a1a1a; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; }
+  body {
+    background: #1a1a1a; color: #e0e0e0; font-family: 'Segoe UI', sans-serif;
+    padding-bottom: 40px;  /* fixed status-bar가 preview를 가리지 않도록 */
+  }
 
   header {
     padding: 12px 20px;
@@ -557,14 +760,25 @@ HTML_TEMPLATE = """
     border-color: #4fc3f7; background: rgba(79, 195, 247, 0.1);
   }
 
-  /* 카메라 체크박스 (다중 모드) */
+  /* 카메라 체크박스 (다중 모드) — .controls 밖의 자체 행 */
   .cam-checkboxes {
     display: none; gap: 8px; flex-wrap: wrap;
+    padding: 8px 20px;
+    background: #252525;
+    border-bottom: 1px solid #333;
   }
   .cam-checkboxes.active { display: flex; }
   .cam-checkboxes label {
     padding: 3px 10px; border: 1px solid #555; border-radius: 3px;
     cursor: pointer; font-size: 12px;
+    max-width: 240px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+
+  /* 액션 버튼 그룹 (controls 우측 고정) */
+  .controls .action-group {
+    display: flex; gap: 8px;
+    margin-left: auto;
   }
   .cam-checkboxes input:checked + span { color: #4fc3f7; }
   .cam-checkboxes label:has(input:checked) {
@@ -597,26 +811,46 @@ HTML_TEMPLATE = """
   .preview-area.single .preview-card { max-width: 960px; }
   .preview-area.multi .preview-card { max-width: 640px; flex: 1 1 45%; }
 
-  /* 파라미터 패널 */
+  /* 파라미터 패널 (controls 아래, preview 위에 고정 위치) */
   .params-panel {
     padding: 12px 20px;
     background: #222;
-    border-top: 1px solid #333;
+    border-bottom: 1px solid #333;
     display: none;
   }
   .params-panel.active { display: block; }
   .params-panel h3 { font-size: 13px; margin-bottom: 8px; color: #aaa; }
+  .param-sliders {
+    display: flex; gap: 24px; flex-wrap: wrap; margin-bottom: 8px;
+  }
+  .param-sliders .param-row {
+    flex: 1 1 340px; margin-bottom: 0;
+  }
   .param-row {
     display: flex; align-items: center; gap: 12px; margin-bottom: 6px;
   }
   .param-row label { font-size: 12px; width: 120px; color: #ccc; }
   .param-row input[type="range"] {
-    flex: 1; max-width: 400px; accent-color: #4fc3f7;
+    flex: 1; accent-color: #4fc3f7;
   }
   .param-row .param-value {
     font-size: 12px; color: #4fc3f7; min-width: 60px;
     font-family: monospace;
   }
+  .preset-row {
+    display: flex; align-items: center; gap: 6px; margin-top: 8px;
+    flex-wrap: wrap;
+  }
+  .preset-row .preset-label {
+    font-size: 12px; color: #888; width: 120px;
+  }
+  .preset-btn {
+    background: #333; color: #e0e0e0; border: 1px solid #555;
+    padding: 4px 12px; border-radius: 3px; cursor: pointer;
+    font-size: 12px;
+  }
+  .preset-btn:hover { background: #3e5368; border-color: #4fc3f7; }
+  .preset-btn.default { border-color: #4fc3f7; color: #4fc3f7; }
 
   /* 트리거 상태 표시 */
   .trigger-status {
@@ -649,6 +883,24 @@ HTML_TEMPLATE = """
     border: 6px solid transparent; border-top-color: #333;
   }
   .trigger-status .warn-icon:hover .tooltip { display: block; }
+
+  /* 타이밍 바 */
+  .timing-bar {
+    display: none;
+    padding: 8px 20px;
+    background: #1e1e1e;
+    border-bottom: 1px solid #333;
+    font-size: 12px; color: #aaa;
+    font-family: 'Courier New', monospace;
+    flex-wrap: wrap; gap: 18px;
+  }
+  .timing-bar.active { display: flex; }
+  .timing-bar .metric { display: inline-flex; gap: 5px; }
+  .timing-bar .label { color: #888; }
+  .timing-bar .val { color: #4fc3f7; }
+  .timing-bar .val.total { color: #fff; font-weight: bold; }
+  .timing-bar .val.delta { color: #81c784; }
+  .timing-bar .val.delta.warn { color: #ffa726; }
 
   /* 상태바 */
   .status-bar {
@@ -687,28 +939,44 @@ HTML_TEMPLATE = """
     </span>
   </div>
 
-  <div class="cam-checkboxes" id="cam-checkboxes"></div>
-
-  <button class="btn btn-primary" id="btn-capture" onclick="doCapture()">Capture</button>
-  <button class="btn btn-success" id="btn-save" onclick="doSave()" disabled>Save</button>
+  <div class="action-group">
+    <button class="btn btn-primary" id="btn-capture" onclick="doCapture()">Capture</button>
+    <button class="btn btn-success" id="btn-save" onclick="doSave()" disabled>Save</button>
+    <button class="btn btn-outline" id="btn-clear" onclick="doClear()" disabled>Clear</button>
+  </div>
 </div>
 
-<div class="preview-area single" id="preview-area">
-  <div class="placeholder">Select a camera and press Capture</div>
-</div>
+<!-- Multi 모드 카메라 체크박스: 자체 행 (action 버튼이 밀려나지 않도록 분리) -->
+<div class="cam-checkboxes" id="cam-checkboxes"></div>
 
 <div class="params-panel" id="params-panel">
   <h3>Camera Parameters (AR0234)</h3>
-  <div class="param-row">
-    <label>Exposure (2-65535)</label>
-    <input type="range" id="slider-exposure" min="2" max="65535" value="5000">
-    <span class="param-value" id="val-exposure">5000</span>
+  <div class="param-sliders">
+    <div class="param-row">
+      <label>Exposure (2-65535)</label>
+      <input type="range" id="slider-exposure" min="2" max="65535" value="900">
+      <span class="param-value" id="val-exposure">900</span>
+    </div>
+    <div class="param-row">
+      <label>Gain (100-1200)</label>
+      <input type="range" id="slider-gain" min="100" max="1200" value="100">
+      <span class="param-value" id="val-gain">100</span>
+    </div>
   </div>
-  <div class="param-row">
-    <label>Gain (100-1200)</label>
-    <input type="range" id="slider-gain" min="100" max="1200" value="400">
-    <span class="param-value" id="val-gain">400</span>
+  <div class="preset-row">
+    <span class="preset-label">Presets</span>
+    <button class="preset-btn" onclick="applyPreset(200, 100)">Outdoor</button>
+    <button class="preset-btn" onclick="applyPreset(900, 100)">Indoor</button>
+    <button class="preset-btn" onclick="applyPreset(1100, 500)">Low Light</button>
+    <button class="preset-btn" onclick="applyPreset(1100, 1000)">Dark</button>
+    <button class="preset-btn default" onclick="applyPreset(900, 100)">Default</button>
   </div>
+</div>
+
+<div class="timing-bar" id="timing-bar"></div>
+
+<div class="preview-area single" id="preview-area">
+  <div class="placeholder">Select a camera and press Capture</div>
 </div>
 
 <div class="status-bar" id="status-bar">Ready</div>
@@ -716,6 +984,41 @@ HTML_TEMPLATE = """
 <script>
 let cameras = [];
 let hasCaptured = false;
+
+// --- 타이밍 바 ---
+function showTiming(t) {
+  const bar = document.getElementById('timing-bar');
+  if (!t) {
+    bar.classList.remove('active');
+    bar.innerHTML = '';
+    return;
+  }
+  const metric = (label, val, cls) => {
+    const c = cls ? (' ' + cls) : '';
+    return '<span class="metric"><span class="label">' + label + '</span>' +
+           '<span class="val' + c + '">' + val + '</span></span>';
+  };
+  const fmt = (v, d) => (v === null || v === undefined) ? '-' : v.toFixed(d) + ' ms';
+
+  const parts = [];
+  // drain은 실제 프레임을 비워낸 경우에만 표시
+  if (t.drain_ms !== undefined && (t.drained || 0) > 0) {
+    parts.push(metric('drain(' + t.drained + ')', fmt(t.drain_ms, 2)));
+  }
+  parts.push(metric('pulse', fmt(t.pulse_ms, 2)));
+  parts.push(metric('grab', fmt(t.grab_ms, 2)));
+  parts.push(metric('retrieve', fmt(t.retrieve_ms, 2)));
+  parts.push(metric('isp', fmt(t.isp_ms, 2)));
+  parts.push(metric('encode', fmt(t.encode_ms, 2)));
+  parts.push(metric('total', fmt(t.total_ms, 2), 'total'));
+  if (t.delta_grab_ms !== null && t.delta_grab_ms !== undefined) {
+    // 2ms 초과 시 주황색 경고
+    const warn = t.delta_grab_ms > 2.0 ? ' warn' : '';
+    parts.push(metric('sync delta', fmt(t.delta_grab_ms, 3), 'delta' + warn));
+  }
+  bar.innerHTML = parts.join('');
+  bar.classList.add('active');
+}
 
 // --- 상태바 ---
 function setStatus(msg, cls) {
@@ -853,30 +1156,51 @@ function getSelectedDev() {
   return null;
 }
 
+// 파라미터(exposure/gain) 적용 대상 AR0234 카메라 리스트.
+// Single 모드: 선택된 AR0234 1대, Multi 모드: 체크된 AR0234 모두.
+function getTargetDevsForParams() {
+  if (getMode() === 'single') {
+    const v = document.getElementById('cam-select').value;
+    if (!v) return [];
+    const dev = parseInt(v);
+    const cam = cameras.find(c => c.dev === dev);
+    return (cam && cam.type === 'ar0234') ? [dev] : [];
+  }
+  const devs = [];
+  document.querySelectorAll('#cam-checkboxes input:checked').forEach(cb => {
+    const dev = parseInt(cb.value);
+    const cam = cameras.find(c => c.dev === dev);
+    if (cam && cam.type === 'ar0234') devs.push(dev);
+  });
+  return devs;
+}
+
 async function updateParamsPanel() {
   const panel = document.getElementById('params-panel');
-  const camType = getSelectedCamType();
-  const dev = getSelectedDev();
+  const devs = getTargetDevsForParams();
 
-  if (camType === 'ar0234' && dev !== null && !isNaN(dev)) {
-    panel.classList.add('active');
-    // 현재 값 로드
-    try {
-      const resp = await fetch('/api/params?dev=' + dev);
-      const p = await resp.json();
-      if (p.exposure && p.exposure !== '?') {
-        document.getElementById('slider-exposure').value = p.exposure;
-        document.getElementById('val-exposure').textContent = p.exposure;
-      }
-      if (p.analogue_gain && p.analogue_gain !== '?') {
-        document.getElementById('slider-gain').value = p.analogue_gain;
-        document.getElementById('val-gain').textContent = p.analogue_gain;
-      }
-    } catch (e) {}
-  } else {
+  if (devs.length === 0) {
     panel.classList.remove('active');
+    return;
   }
+  panel.classList.add('active');
+  // 첫 번째 타겟 카메라 기준으로 현재 값 read-back
+  try {
+    const resp = await fetch('/api/params?dev=' + devs[0]);
+    const p = await resp.json();
+    if (p.exposure && p.exposure !== '?') {
+      document.getElementById('slider-exposure').value = p.exposure;
+      document.getElementById('val-exposure').textContent = p.exposure;
+    }
+    if (p.analogue_gain && p.analogue_gain !== '?') {
+      document.getElementById('slider-gain').value = p.analogue_gain;
+      document.getElementById('val-gain').textContent = p.analogue_gain;
+    }
+  } catch (e) {}
 }
+
+// Multi 모드에서 체크박스 변경 시에도 패널 갱신
+document.getElementById('cam-checkboxes').addEventListener('change', updateParamsPanel);
 
 // 슬라이더 디바운스
 let paramTimer = null;
@@ -884,17 +1208,18 @@ function onSliderChange(name, slider, display) {
   display.textContent = slider.value;
   clearTimeout(paramTimer);
   paramTimer = setTimeout(() => {
-    const dev = getSelectedDev();
-    if (dev === null || isNaN(dev)) return;
-    const body = { dev: dev };
-    body[name] = parseInt(slider.value);
-    fetch('/api/params', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    }).then(() => {
-      setStatus(name + ' = ' + slider.value + ' (cam' + dev + ')', 'ok');
+    const devs = getTargetDevsForParams();
+    if (devs.length === 0) return;
+    devs.forEach(dev => {
+      const body = { dev: dev };
+      body[name] = parseInt(slider.value);
+      fetch('/api/params', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
     });
+    setStatus(name + ' = ' + slider.value + ' (' + devs.length + ' cam)', 'ok');
   }, 200);
 }
 
@@ -904,6 +1229,30 @@ document.getElementById('slider-exposure').addEventListener('input', function() 
 document.getElementById('slider-gain').addEventListener('input', function() {
   onSliderChange('analogue_gain', this, document.getElementById('val-gain'));
 });
+
+// --- 프리셋 (Outdoor/Indoor/Low Light/Dark/Default) ---
+// 슬라이더 디바운스와 별개로, 버튼 클릭 시 즉시 두 값을 브로드캐스트.
+function applyPreset(exposure, gain) {
+  document.getElementById('slider-exposure').value = exposure;
+  document.getElementById('val-exposure').textContent = exposure;
+  document.getElementById('slider-gain').value = gain;
+  document.getElementById('val-gain').textContent = gain;
+
+  const devs = getTargetDevsForParams();
+  if (devs.length === 0) {
+    setStatus('Select AR0234 camera(s) first', 'error');
+    return;
+  }
+  devs.forEach(dev => {
+    fetch('/api/params', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dev: dev, exposure: exposure, analogue_gain: gain })
+    });
+  });
+  setStatus('preset: exposure=' + exposure + ' gain=' + gain +
+            ' (' + devs.length + ' cam)', 'ok');
+}
 
 // --- 촬영 ---
 async function doCapture() {
@@ -954,6 +1303,8 @@ async function doCapture() {
 
     hasCaptured = true;
     document.getElementById('btn-save').disabled = false;
+    document.getElementById('btn-clear').disabled = false;
+    showTiming(data.timing);
 
     let msg = data.images.length + ' image(s) captured';
     if (data.warning) msg += ' (warning: ' + data.warning + ')';
@@ -988,6 +1339,21 @@ async function doSave() {
   } catch (e) {
     setStatus('Save failed: ' + e.message, 'error');
   }
+}
+
+// --- 화면 초기화 ---
+async function doClear() {
+  try {
+    await fetch('/api/clear', { method: 'POST' });
+  } catch (e) {}
+  const area = document.getElementById('preview-area');
+  area.className = 'preview-area single';
+  area.innerHTML = '<div class="placeholder">Select a camera and press Capture</div>';
+  hasCaptured = false;
+  document.getElementById('btn-save').disabled = true;
+  document.getElementById('btn-clear').disabled = true;
+  showTiming(null);
+  setStatus('Preview cleared', 'info');
 }
 
 // --- 종료 ---
