@@ -66,3 +66,6 @@ captured_images/
 # 환경변수 / 로컬 설정
 .env
 .env.local
+
+# CLAUDE
+CLAUDE.md
