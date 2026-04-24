@@ -26,7 +26,8 @@ import cv2
 from flask import Flask, jsonify, render_template_string, request
 
 from ar0234_cam.v4l2_utils import (
-    V4L2_BA10, check_trigger_mode, v4l2_get, v4l2_set,
+    V4L2_BA10, check_trigger_mode, has_video_capture_cap, list_resolutions,
+    v4l2_get, v4l2_set,
 )
 from ar0234_cam.isp import _USE_GPU, demosaic
 
@@ -55,8 +56,11 @@ class AppState:
         self.cameras = []           # 감지된 카메라 목록
         self.captured = {}          # {dev: {"bgr": ndarray, "jpeg_b64": str, "timestamp": str}}
         self.use_gpu = _USE_GPU
-        self.width = 1920
-        self.height = 1080
+        # CLI --width/--height 의 기본값. 개별 카메라 해상도가 지정되지 않았을 때
+        # fallback으로 사용된다.
+        self.default_width = 1920
+        self.default_height = 1080
+        self._cam_res = {}          # {dev: (w, h)} — per-camera 해상도
         self._open_caps = {}        # {dev: cv2.VideoCapture} 열린 카메라 세션
         self._cap_info = {}         # {dev: {"w": int, "h": int, "trigger": bool, "type": str}}
 
@@ -92,6 +96,10 @@ def detect_all_cameras():
     found = []
     for i in range(16):
         if not os.path.exists(f"/dev/video{i}"):
+            continue
+        # UVC 카메라의 metadata-only 노드 등 Video Capture 능력이 없는 디바이스는
+        # cv2.VideoCapture 로 열면 OpenCV 경고가 뜨므로 사전에 필터링.
+        if not has_video_capture_cap(i):
             continue
 
         # AR0234 (BA10 포맷) 확인
@@ -232,14 +240,39 @@ def _sync_pulse_grab_ar0234():
 
 
 def _release_caps():
-    """열려 있는 모든 카메라 세션을 해제한다."""
-    for dev, cap in state._open_caps.items():
+    """열려 있는 모든 카메라 세션을 해제한다.
+
+    Flask threaded=True 환경에서 /api/cameras/refresh 와 /api/params,
+    /api/capture 등이 동시에 실행되면 iteration 중 dict가 수정되어
+    RuntimeError 가 난다. 스냅샷을 뜨고, 락으로 다른 경로와 상호배제.
+    """
+    with state.lock:
+        caps = list(state._open_caps.items())
+        state._open_caps.clear()
+        state._cap_info.clear()
+    for dev, cap in caps:
         try:
             cap.release()
         except Exception:
             pass
-    state._open_caps.clear()
-    state._cap_info.clear()
+
+
+# Default 프리셋 (Indoor 기준) — UI 슬라이더 초기값과 일치시켜 페이지 로드 시
+# v4l2_get read-back이 700 같은 센서 부팅값이 아니라 900/100으로 보이도록 한다.
+_AR0234_DEFAULT_EXPOSURE = 900
+_AR0234_DEFAULT_GAIN = 100
+
+
+def _init_ar0234_defaults(dev):
+    """AR0234 카메라에 override_enable과 Default 프리셋 값을 써둔다.
+
+    startup / camera refresh / resolution 변경 / ensure_cap_open 등 세션 리셋
+    지점에서 호출하여 `/api/params` GET이 항상 일관된 값(900/100)을 반환하도록
+    만든다. 멱등(idempotent)이므로 반복 호출해도 안전.
+    """
+    v4l2_set(dev, "override_enable", 1)
+    v4l2_set(dev, "exposure", _AR0234_DEFAULT_EXPOSURE)
+    v4l2_set(dev, "analogue_gain", _AR0234_DEFAULT_GAIN)
 
 
 def _ensure_cap_open(dev_num, cam_type):
@@ -263,7 +296,10 @@ def _ensure_cap_open(dev_num, cam_type):
     # 레지스터에 적용된다. STREAMON 이후엔 반영이 보장되지 않으므로
     # VideoCapture 열기 전에 설정.
     if cam_type == "ar0234":
-        v4l2_set(dev_num, "override_enable", 1)
+        _init_ar0234_defaults(dev_num)
+
+    w, h = state._cam_res.get(
+        dev_num, (state.default_width, state.default_height))
 
     cap = cv2.VideoCapture(dev_num, cv2.CAP_V4L2)
     # V4L2 DMA 버퍼 링을 최소화 — stale frame lag 방지.
@@ -272,8 +308,15 @@ def _ensure_cap_open(dev_num, cam_type):
     if cam_type == "ar0234":
         cap.set(cv2.CAP_PROP_FOURCC, V4L2_BA10)
         cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, state.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, state.height)
+    elif cam_type == "usb":
+        # UVC 카메라는 포맷마다 지원 해상도 범위가 다르다. YUYV 는 대역폭 제약으로
+        # 고해상도만 지원하는 경우가 많아(예: 1280x720 이상만), 저해상도(800x600,
+        # 640x480, 320x240) 선택이 실제로 반영되지 않고 V4L2 가 가장 가까운
+        # YUYV 해상도로 롤백하는 문제가 있다. MJPG 는 UVC 표준이고 저해상도까지
+        # 넓게 커버하므로 기본 포맷으로 강제. OpenCV 가 자동 디코드해서 BGR 반환.
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
 
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -308,6 +351,13 @@ def _ensure_cap_open(dev_num, cam_type):
         for _ in range(3):
             cap.grab()
             cap.retrieve()
+
+    # STREAMON(첫 grab) 시점에 Tegra 드라이버가 exposure/analogue_gain을
+    # V4L2 default(700/100) 로 한 번 리셋한다(override_enable=1 이어도 그렇다).
+    # 워밍업 이후 재주입하면 이후 캡처까지 sticky하므로 여기서 다시 써준다.
+    if cam_type == "ar0234":
+        v4l2_set(dev_num, "exposure", _AR0234_DEFAULT_EXPOSURE)
+        v4l2_set(dev_num, "analogue_gain", _AR0234_DEFAULT_GAIN)
 
     state._open_caps[dev_num] = cap
     state._cap_info[dev_num] = {
@@ -399,14 +449,11 @@ def capture_multi(dev_nums, cam_infos):
     if ar0234_devs:
         caps = {}
         for dev in ar0234_devs:
-            cap, actual_w, actual_h, is_trigger = _ensure_cap_open(dev, "ar0234")
+            cap, _, _, is_trigger = _ensure_cap_open(dev, "ar0234")
             if not is_trigger:
                 return {}, (f"cam{dev} trigger_mode 비활성. "
                            "먼저: python3 trigger_mode_ctrl.py on"), timing
             caps[dev] = cap
-
-        info = state._cap_info[ar0234_devs[0]]
-        actual_w, actual_h = info["w"], info["h"]
 
         # 펄스 + 열린 모든 AR0234 병렬 grab (타겟 외 cam이 있어도 큐 sync 유지).
         # Multi에서도 drain은 하지 않음 — 카메라별 독립 drain은 큐 비대칭을
@@ -437,11 +484,13 @@ def capture_multi(dev_nums, cam_infos):
         try:
             for dev in ar0234_devs:
                 if dev in raws:
+                    # 카메라마다 해상도가 다를 수 있으므로 per-cam 으로 조회.
+                    info = state._cap_info[dev]
+                    h, w = info["h"], info["w"]
                     if state.use_gpu:
-                        bgr, _ = demosaic_gpu(raws[dev], actual_h, actual_w,
-                                              buf_id=dev)
+                        bgr, _ = demosaic_gpu(raws[dev], h, w, buf_id=dev)
                     else:
-                        bgr = demosaic(raws[dev], actual_h, actual_w)
+                        bgr = demosaic(raws[dev], h, w)
                     results[dev] = bgr
         finally:
             if state.use_gpu and _cuda_ctx is not None:
@@ -491,13 +540,18 @@ def api_cameras_refresh():
     with state.lock:
         state.cameras = cameras
 
-    # AR0234 카메라가 있으면 trigger_mode 복원
-    ar0234_exists = any(c["type"] == "ar0234" for c in cameras)
-    if ar0234_exists:
-        subprocess.run(
-            [sys.executable, "trigger_mode_ctrl.py", "on"],
-            capture_output=True, timeout=10
-        )
+    # AR0234 카메라가 있으면 trigger_mode 복원 + Default 프리셋 값을 미리 적용
+    # (UI의 슬라이더 초기값과 센서 레지스터를 일치시켜 로드 시 flicker 방지).
+    for c in cameras:
+        if c["type"] == "ar0234":
+            subprocess.run(
+                [sys.executable, "trigger_mode_ctrl.py", "on"],
+                capture_output=True, timeout=10
+            )
+            break
+    for c in cameras:
+        if c["type"] == "ar0234":
+            _init_ar0234_defaults(c["dev"])
 
     return jsonify(cameras)
 
@@ -685,6 +739,66 @@ def api_params_set():
     return jsonify({"changed": changed})
 
 
+@app.route("/api/resolutions", methods=["GET"])
+def api_resolutions():
+    """해당 카메라의 지원 해상도 목록 + 현재 선택된 해상도."""
+    dev = request.args.get("dev", type=int)
+    if dev is None:
+        return jsonify({"error": "dev 필요"}), 400
+
+    cam = next((c for c in state.cameras if c["dev"] == dev), None)
+    # 실제 capture 시 사용하는 포맷에 맞춰 enumerate — 드롭다운에 뜬 해상도가
+    # 전부 실제 적용되도록. AR0234=BA10, USB=MJPG (저해상도 포함 넓은 커버리지).
+    if cam and cam["type"] == "ar0234":
+        res = list_resolutions(dev, fourcc_filter="BA10")
+        if not res:
+            # 드라이버가 enumerate를 비정상 반환할 때를 대비한 fallback.
+            res = [(1920, 1200), (1920, 1080), (1280, 720)]
+    elif cam and cam["type"] == "usb":
+        res = list_resolutions(dev, fourcc_filter="MJPG")
+        if not res:
+            res = list_resolutions(dev, fourcc_filter="YUYV")
+        if not res:
+            res = list_resolutions(dev)
+    else:
+        res = list_resolutions(dev)
+
+    current = state._cam_res.get(
+        dev, (state.default_width, state.default_height))
+    return jsonify({"resolutions": res, "current": list(current)})
+
+
+@app.route("/api/resolution", methods=["POST"])
+def api_resolution_set():
+    """카메라의 해상도를 변경한다. 열려있는 세션은 닫아서 다음 Capture 때 재오픈."""
+    data = request.get_json(force=True)
+    dev = data.get("dev")
+    if dev is None or "width" not in data or "height" not in data:
+        return jsonify({"error": "dev, width, height 필요"}), 400
+
+    w, h = int(data["width"]), int(data["height"])
+    state._cam_res[dev] = (w, h)
+
+    cap = state._open_caps.pop(dev, None)
+    state._cap_info.pop(dev, None)
+    if cap is not None:
+        try:
+            cap.release()
+        except Exception:
+            pass
+
+    # AR0234는 release 시 trigger_mode/override가 리셋될 수 있으므로 복원.
+    cam = next((c for c in state.cameras if c["dev"] == dev), None)
+    if cam and cam["type"] == "ar0234":
+        subprocess.run(
+            [sys.executable, "trigger_mode_ctrl.py", "on"],
+            capture_output=True, timeout=10,
+        )
+        _init_ar0234_defaults(dev)
+
+    return jsonify({"dev": dev, "width": w, "height": h})
+
+
 # ---------------------------------------------------------------------------
 # HTML 템플릿
 # ---------------------------------------------------------------------------
@@ -735,13 +849,26 @@ HTML_TEMPLATE = """
   .btn-primary { background: #1565c0; color: #fff; }
   .btn-primary:hover { background: #1976d2; }
   .btn-primary:disabled { background: #555; cursor: not-allowed; }
+  /* Capture: primary 중에서도 위계를 한 단계 더 — 사용자가 가장 자주 누르는 메인 액션.
+     Save 와 시각적으로 분명히 구분하려고 패딩/폰트 키움. */
+  .btn-capture {
+    padding: 9px 32px; font-size: 14px; font-weight: 700;
+    letter-spacing: 0.3px;
+  }
   .btn-success { background: #2e7d32; color: #fff; }
   .btn-success:hover { background: #388e3c; }
   .btn-success:disabled { background: #555; cursor: not-allowed; }
+  /* Save 를 outline 으로 낮춰 Capture 와 시각적 무게를 분리. 위치도 프리뷰 쪽으로 이동. */
+  .btn-success-outline {
+    background: transparent; color: #81c784; border: 1px solid #2e7d32;
+  }
+  .btn-success-outline:hover { background: rgba(46, 125, 50, 0.18); color: #a5d6a7; border-color: #388e3c; }
+  .btn-success-outline:disabled { color: #555; border-color: #444; cursor: not-allowed; background: transparent; }
   .btn-outline {
     background: transparent; color: #aaa; border: 1px solid #555;
   }
   .btn-outline:hover { color: #fff; border-color: #888; }
+  .btn-outline:disabled { color: #555; border-color: #444; cursor: not-allowed; }
 
   .mode-toggle {
     display: flex; gap: 0;
@@ -785,6 +912,18 @@ HTML_TEMPLATE = """
     border-color: #4fc3f7; background: rgba(79, 195, 247, 0.1);
   }
   .cam-checkboxes input[type="checkbox"] { display: none; }
+
+  /* 캡처 결과 액션 툴바 — 프리뷰 바로 위. Save/Clear 는 "찍은 이미지에 대한 조치"이므로
+     프리뷰 근처에 배치해 Capture(상단) 와 위치로도 구분. */
+  .preview-toolbar {
+    padding: 8px 20px;
+    display: flex; gap: 8px; justify-content: flex-end; align-items: center;
+    background: #1e1e1e;
+    border-bottom: 1px solid #2a2a2a;
+  }
+  .preview-toolbar .hint {
+    margin-right: auto; color: #555; font-size: 12px; font-style: italic;
+  }
 
   /* 미리보기 영역 */
   .preview-area {
@@ -902,6 +1041,30 @@ HTML_TEMPLATE = """
   .timing-bar .val.delta { color: #81c784; }
   .timing-bar .val.delta.warn { color: #ffa726; }
 
+  /* Busy 상태: 세팅/촬영 진행 중 전체 인터랙션 영역을 디밍하고 클릭 차단. */
+  body.busy { cursor: wait; }
+  body.busy header,
+  body.busy .controls,
+  body.busy .cam-checkboxes,
+  body.busy .params-panel {
+    opacity: 0.5;
+    pointer-events: none;
+  }
+  body.busy .status-bar { opacity: 1; }
+
+  /* 스피너 — 상태바에서 진행 중 표시 */
+  .spinner {
+    display: inline-block;
+    width: 12px; height: 12px;
+    margin-right: 8px;
+    vertical-align: middle;
+    border: 2px solid #444;
+    border-top-color: #4fc3f7;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
   /* 상태바 */
   .status-bar {
     padding: 8px 20px;
@@ -925,7 +1088,12 @@ HTML_TEMPLATE = """
 <div class="controls">
   <label>Camera:</label>
   <select id="cam-select"><option value="">-- loading --</option></select>
-  <button class="btn btn-outline" onclick="refreshCameras()">Refresh</button>
+  <button class="btn btn-outline" id="btn-refresh" onclick="refreshCameras()">Refresh</button>
+
+  <label>Resolution:</label>
+  <select id="res-select" disabled>
+    <option value="">-- select a camera --</option>
+  </select>
 
   <div class="mode-toggle">
     <label><input type="radio" name="mode" value="single" checked><span>Single</span></label>
@@ -940,9 +1108,7 @@ HTML_TEMPLATE = """
   </div>
 
   <div class="action-group">
-    <button class="btn btn-primary" id="btn-capture" onclick="doCapture()">Capture</button>
-    <button class="btn btn-success" id="btn-save" onclick="doSave()" disabled>Save</button>
-    <button class="btn btn-outline" id="btn-clear" onclick="doClear()" disabled>Clear</button>
+    <button class="btn btn-primary btn-capture" id="btn-capture" onclick="doCapture()">Capture</button>
   </div>
 </div>
 
@@ -975,6 +1141,12 @@ HTML_TEMPLATE = """
 
 <div class="timing-bar" id="timing-bar"></div>
 
+<div class="preview-toolbar">
+  <span class="hint">Captured image actions</span>
+  <button class="btn btn-success-outline" id="btn-save" onclick="doSave()" disabled>Save</button>
+  <button class="btn btn-outline" id="btn-clear" onclick="doClear()" disabled>Clear</button>
+</div>
+
 <div class="preview-area single" id="preview-area">
   <div class="placeholder">Select a camera and press Capture</div>
 </div>
@@ -984,6 +1156,36 @@ HTML_TEMPLATE = """
 <script>
 let cameras = [];
 let hasCaptured = false;
+let busyState = false;
+
+// 수 초가 걸리는 작업(해상도 변경 / 카메라 재검출 / 촬영) 동안 모든 인터랙션
+// 요소(버튼·드롭다운·슬라이더·라디오·체크박스·프리셋·Close)를 비활성화하고
+// 상태바에 스피너를 띄워 "지금 세팅 중"임을 시각적으로 명확히 보여준다.
+// body.busy CSS 클래스로 추가 디밍/pointer-events:none 중첩 차단.
+function setBusy(on, msg) {
+  busyState = on;
+  document.body.classList.toggle('busy', on);
+
+  if (on && msg) {
+    const bar = document.getElementById('status-bar');
+    bar.className = 'status-bar';
+    bar.innerHTML = '<span class="spinner"></span><span class="info">' + msg + '</span>';
+  }
+
+  // 모든 인터랙티브 요소 잠금 (pointer-events:none 은 CSS 에서 처리하되,
+  // disabled 속성도 함께 설정해 프로그램적 제출/키보드 Enter 도 차단).
+  document.querySelectorAll(
+    'button, select, input[type="range"], input[type="radio"], input[type="checkbox"]'
+  ).forEach(el => { el.disabled = on; });
+
+  if (!on) {
+    // Save / Clear: 이전 캡처 존재 여부에 따라 복원.
+    document.getElementById('btn-save').disabled = !hasCaptured;
+    document.getElementById('btn-clear').disabled = !hasCaptured;
+    // Resolution 드롭다운: 선택된 카메라 기준 enable 재계산.
+    updateResolutionDropdown();
+  }
+}
 
 // --- 타이밍 바 ---
 function showTiming(t) {
@@ -1040,6 +1242,7 @@ document.querySelectorAll('input[name="mode"]').forEach(r => {
     cb.classList.toggle('active', multi);
     updateTriggerStatus();
     updateParamsPanel();
+    updateResolutionDropdown();
   });
 });
 
@@ -1099,21 +1302,29 @@ async function loadCameras(cams) {
     });
   }
 
-  // 체크박스 (다중 모드)
+  // 체크박스 (다중 모드) — GPIO 트리거 동기 촬영은 AR0234에만 유효하므로
+  // USB 카메라는 Multi 체크박스에서 제외한다 (Single 모드에서는 그대로 사용).
   const cb = document.getElementById('cam-checkboxes');
   cb.innerHTML = '';
-  cams.forEach(c => {
-    const lbl = document.createElement('label');
-    lbl.innerHTML = '<input type="checkbox" value="' + c.dev + '" data-type="' + c.type + '"><span>' + c.label + '</span>';
-    cb.appendChild(lbl);
-  });
+  const multiCams = cams.filter(c => c.type === 'ar0234');
+  if (multiCams.length === 0) {
+    cb.innerHTML = '<span style="color:#888;font-size:12px;padding:3px 4px;">No AR0234 cameras for multi-sync capture</span>';
+  } else {
+    multiCams.forEach(c => {
+      const lbl = document.createElement('label');
+      lbl.innerHTML = '<input type="checkbox" value="' + c.dev + '" data-type="' + c.type + '"><span>' + c.label + '</span>';
+      cb.appendChild(lbl);
+    });
+  }
 
   updateParamsPanel();
   updateTriggerStatus();
+  updateResolutionDropdown();
 }
 
 async function refreshCameras() {
-  setStatus('Scanning cameras...', 'info');
+  if (busyState) return;
+  setBusy(true, 'Scanning cameras...');
   try {
     const resp = await fetch('/api/cameras/refresh', { method: 'POST' });
     const cams = await resp.json();
@@ -1121,6 +1332,8 @@ async function refreshCameras() {
     setStatus(cams.length + ' camera(s) detected', 'ok');
   } catch (e) {
     setStatus('Camera scan failed: ' + e.message, 'error');
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -1136,8 +1349,11 @@ async function refreshCameras() {
   }
 })();
 
-// 드롭다운 변경 시 파라미터 패널 업데이트
-document.getElementById('cam-select').addEventListener('change', updateParamsPanel);
+// 드롭다운 변경 시 파라미터 패널 & 해상도 목록 업데이트
+document.getElementById('cam-select').addEventListener('change', () => {
+  updateParamsPanel();
+  updateResolutionDropdown();
+});
 
 // --- 파라미터 패널 ---
 function getSelectedCamType() {
@@ -1199,8 +1415,11 @@ async function updateParamsPanel() {
   } catch (e) {}
 }
 
-// Multi 모드에서 체크박스 변경 시에도 패널 갱신
-document.getElementById('cam-checkboxes').addEventListener('change', updateParamsPanel);
+// Multi 모드에서 체크박스 변경 시에도 패널 & 해상도 목록 갱신
+document.getElementById('cam-checkboxes').addEventListener('change', () => {
+  updateParamsPanel();
+  updateResolutionDropdown();
+});
 
 // 슬라이더 디바운스
 let paramTimer = null;
@@ -1230,6 +1449,73 @@ document.getElementById('slider-gain').addEventListener('input', function() {
   onSliderChange('analogue_gain', this, document.getElementById('val-gain'));
 });
 
+// --- 해상도 드롭다운 ---
+// Single: 선택된 1대, Multi: 체크된 전체.
+function getResolutionTargets() {
+  if (getMode() === 'single') {
+    const v = document.getElementById('cam-select').value;
+    return v ? [parseInt(v)] : [];
+  }
+  const out = [];
+  document.querySelectorAll('#cam-checkboxes input:checked')
+    .forEach(cb => out.push(parseInt(cb.value)));
+  return out;
+}
+
+async function updateResolutionDropdown() {
+  const sel = document.getElementById('res-select');
+  const devs = getResolutionTargets();
+  if (devs.length === 0) {
+    sel.innerHTML = '<option value="">-- select a camera --</option>';
+    sel.disabled = true;
+    return;
+  }
+  try {
+    const r = await fetch('/api/resolutions?dev=' + devs[0]).then(r => r.json());
+    const opts = (r.resolutions || []).map(
+      ([w, h]) => '<option value="' + w + 'x' + h + '">' + w + ' x ' + h + '</option>'
+    );
+    sel.innerHTML = opts.length ? opts.join('') : '<option value="">(no resolutions)</option>';
+    if (r.current && r.current.length === 2) {
+      const key = r.current[0] + 'x' + r.current[1];
+      // 일치하는 옵션이 있을 때만 선택 (없으면 첫 번째 옵션이 자동 선택됨).
+      if ([...sel.options].some(o => o.value === key)) {
+        sel.value = key;
+      }
+    }
+    sel.disabled = opts.length === 0;
+  } catch (e) {
+    sel.innerHTML = '<option value="">(error)</option>';
+    sel.disabled = true;
+  }
+}
+
+document.getElementById('res-select').addEventListener('change', async function() {
+  if (busyState) return;
+  if (!this.value) return;
+  const [w, h] = this.value.split('x').map(Number);
+  const devs = getResolutionTargets();
+  if (devs.length === 0) {
+    setStatus('Select a camera first', 'error');
+    return;
+  }
+  setBusy(true, 'Setting resolution ' + w + 'x' + h + '...');
+  try {
+    await Promise.all(devs.map(dev =>
+      fetch('/api/resolution', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dev: dev, width: w, height: h })
+      })
+    ));
+    setStatus('resolution ' + w + 'x' + h + ' (' + devs.length + ' cam, applied on next Capture)', 'ok');
+  } catch (e) {
+    setStatus('Resolution change failed: ' + e.message, 'error');
+  } finally {
+    setBusy(false);
+  }
+});
+
 // --- 프리셋 (Outdoor/Indoor/Low Light/Dark/Default) ---
 // 슬라이더 디바운스와 별개로, 버튼 클릭 시 즉시 두 값을 브로드캐스트.
 function applyPreset(exposure, gain) {
@@ -1256,6 +1542,7 @@ function applyPreset(exposure, gain) {
 
 // --- 촬영 ---
 async function doCapture() {
+  if (busyState) return;
   const mode = getMode();
   let devices = [];
 
@@ -1270,9 +1557,7 @@ async function doCapture() {
     if (devices.length === 0) { setStatus('Select at least one camera', 'error'); return; }
   }
 
-  setStatus('Capturing...', 'info');
-  document.getElementById('btn-capture').disabled = true;
-
+  setBusy(true, 'Capturing...');
   try {
     const resp = await fetch('/api/capture', {
       method: 'POST',
@@ -1283,7 +1568,6 @@ async function doCapture() {
 
     if (data.error) {
       setStatus(data.error, 'error');
-      document.getElementById('btn-capture').disabled = false;
       return;
     }
 
@@ -1312,9 +1596,9 @@ async function doCapture() {
 
   } catch (e) {
     setStatus('Capture failed: ' + e.message, 'error');
+  } finally {
+    setBusy(false);
   }
-
-  document.getElementById('btn-capture').disabled = false;
 }
 
 // --- 저장 ---
@@ -1387,8 +1671,8 @@ def main():
                         help="GPU 대신 CPU demosaic 사용")
     args = parser.parse_args()
 
-    state.width = args.width
-    state.height = args.height
+    state.default_width = args.width
+    state.default_height = args.height
     if args.cpu:
         state.use_gpu = False
 
@@ -1397,14 +1681,21 @@ def main():
     print(f"[INFO] {len(state.cameras)}개 카메라 감지: "
           f"{[c['label'] for c in state.cameras]}")
 
-    # AR0234 카메라가 있으면 trigger_mode 자동 활성화
-    if any(c["type"] == "ar0234" for c in state.cameras):
+    # AR0234 카메라가 있으면 trigger_mode 자동 활성화 + Default 프리셋 사전 적용
+    ar0234_devs = [c["dev"] for c in state.cameras if c["type"] == "ar0234"]
+    if ar0234_devs:
         print("[INFO] trigger_mode 활성화 중...")
         subprocess.run(
             [sys.executable, "trigger_mode_ctrl.py", "on"],
             capture_output=True, timeout=10
         )
         print("[INFO] trigger_mode=ON 완료")
+        # 브라우저에서 /api/params 초기 GET이 800/? 같은 센서 부팅값을 읽지 않도록
+        # 서버 시작 시점에 override_enable=1, exposure=900, gain=100 을 써둔다.
+        for dev in ar0234_devs:
+            _init_ar0234_defaults(dev)
+        print(f"[INFO] AR0234 기본값(exposure={_AR0234_DEFAULT_EXPOSURE}, "
+              f"gain={_AR0234_DEFAULT_GAIN}) 적용")
 
     print(f"[INFO] ISP: {'GPU (PyCUDA)' if state.use_gpu else 'CPU'}")
     print(f"[INFO] Camera Test GUI: http://0.0.0.0:{args.port}/")
