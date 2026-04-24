@@ -15,6 +15,7 @@
 
 import argparse
 import base64
+import collections
 import os
 import subprocess
 import sys
@@ -23,7 +24,7 @@ import time
 from datetime import datetime
 
 import cv2
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, Response, jsonify, render_template_string, request
 
 from ar0234_cam.v4l2_utils import (
     V4L2_BA10, check_trigger_mode, has_video_capture_cap, list_resolutions,
@@ -63,6 +64,12 @@ class AppState:
         self._cam_res = {}          # {dev: (w, h)} — per-camera 해상도
         self._open_caps = {}        # {dev: cv2.VideoCapture} 열린 카메라 세션
         self._cap_info = {}         # {dev: {"w": int, "h": int, "trigger": bool, "type": str}}
+        # OpenCV VideoCapture 는 thread-safe 하지 않으므로, 스트리머 백그라운드
+        # 루프와 /api/capture 요청이 같은 cap 의 grab/retrieve 를 동시에 건드리지
+        # 않도록 직렬화한다. demosaic/encode 는 락 밖에서.
+        self.cap_lock = threading.Lock()
+        # 단일 카메라 스트리밍 스코프: 활성 Streamer 인스턴스 또는 None.
+        self.streamer = None
 
 
 state = AppState()
@@ -246,6 +253,11 @@ def _release_caps():
     /api/capture 등이 동시에 실행되면 iteration 중 dict가 수정되어
     RuntimeError 가 난다. 스냅샷을 뜨고, 락으로 다른 경로와 상호배제.
     """
+    # 스트리머가 돌고 있으면 cap release 전에 먼저 중지 (루프가 released cap
+    # 을 건드리지 않도록).
+    if state.streamer is not None:
+        state.streamer.stop()
+        state.streamer = None
     with state.lock:
         caps = list(state._open_caps.items())
         state._open_caps.clear()
@@ -383,30 +395,35 @@ def capture_single(dev_num, cam_type):
               "retrieve_ms": 0.0, "isp_ms": 0.0,
               "drain_ms": 0.0, "drained": 0}
 
-    # 큐에 쌓인 stale 프레임 제거 — 항상 최신 프레임이 나오도록
-    t0 = time.monotonic()
-    timing["drained"] = _drain_queue(cap)
-    timing["drain_ms"] = (time.monotonic() - t0) * 1000
-
-    if is_trigger:
-        # 펄스 + 열린 모든 AR0234 병렬 grab (큐 동기화)
-        grabs, pulse_ms, grab_ms = _sync_pulse_grab_ar0234()
-        timing["pulse_ms"] = pulse_ms
-        timing["grab_ms"] = grab_ms
-        if not grabs.get(dev_num, {}).get("ok", False):
-            return None, timing
-    else:
+    # grab/retrieve 는 cap_lock 으로 직렬화 — 백그라운드 스트리머가 동일 cap
+    # 을 동시에 건드릴 때 OpenCV 비-thread-safe 상태에 빠지는 것을 방지.
+    # demosaic 은 락 밖에서.
+    frame = None
+    with state.cap_lock:
+        # 큐에 쌓인 stale 프레임 제거 — 항상 최신 프레임이 나오도록
         t0 = time.monotonic()
-        ret = cap.grab()
-        timing["grab_ms"] = (time.monotonic() - t0) * 1000
+        timing["drained"] = _drain_queue(cap)
+        timing["drain_ms"] = (time.monotonic() - t0) * 1000
+
+        if is_trigger:
+            # 펄스 + 열린 모든 AR0234 병렬 grab (큐 동기화)
+            grabs, pulse_ms, grab_ms = _sync_pulse_grab_ar0234()
+            timing["pulse_ms"] = pulse_ms
+            timing["grab_ms"] = grab_ms
+            if not grabs.get(dev_num, {}).get("ok", False):
+                return None, timing
+        else:
+            t0 = time.monotonic()
+            ret = cap.grab()
+            timing["grab_ms"] = (time.monotonic() - t0) * 1000
+            if not ret:
+                return None, timing
+
+        t0 = time.monotonic()
+        ret, frame = cap.retrieve()
+        timing["retrieve_ms"] = (time.monotonic() - t0) * 1000
         if not ret:
             return None, timing
-
-    t0 = time.monotonic()
-    ret, frame = cap.retrieve()
-    timing["retrieve_ms"] = (time.monotonic() - t0) * 1000
-    if not ret:
-        return None, timing
 
     t0 = time.monotonic()
     if cam_type == "ar0234":
@@ -459,21 +476,25 @@ def capture_multi(dev_nums, cam_infos):
         # Multi에서도 drain은 하지 않음 — 카메라별 독립 drain은 큐 비대칭을
         # 만들어 sync를 깬다. 대신 매 pulse마다 모든 AR0234를 동시에 grab해
         # 큐 상태를 항상 동일하게 맞춘다.
-        grabs, pulse_ms, grab_ms = _sync_pulse_grab_ar0234()
-        timing["pulse_ms"] = pulse_ms
-        timing["grab_ms"] = grab_ms
+        # grab/retrieve 는 cap_lock 으로 직렬화 (스트리머와 공존 보장).
+        raws = {}
+        errors = []
+        with state.cap_lock:
+            grabs, pulse_ms, grab_ms = _sync_pulse_grab_ar0234()
+            timing["pulse_ms"] = pulse_ms
+            timing["grab_ms"] = grab_ms
 
-        # sync delta는 "타겟" 카메라들의 grab 시간으로만 계산
-        target_grab_times = [grabs[d]["grab_ms"] for d in ar0234_devs
-                             if grabs.get(d, {}).get("ok")]
-        if len(target_grab_times) >= 2:
-            timing["delta_grab_ms"] = (max(target_grab_times) -
-                                        min(target_grab_times))
+            # sync delta는 "타겟" 카메라들의 grab 시간으로만 계산
+            target_grab_times = [grabs[d]["grab_ms"] for d in ar0234_devs
+                                 if grabs.get(d, {}).get("ok")]
+            if len(target_grab_times) >= 2:
+                timing["delta_grab_ms"] = (max(target_grab_times) -
+                                            min(target_grab_times))
 
-        t0 = time.monotonic()
-        raws, errors = parallel_retrieve(caps, ar0234_devs, grabs)
-        timing["retrieve_ms"] = (time.monotonic() - t0) * 1000
-        # release 하지 않음 — 세션 유지
+            t0 = time.monotonic()
+            raws, errors = parallel_retrieve(caps, ar0234_devs, grabs)
+            timing["retrieve_ms"] = (time.monotonic() - t0) * 1000
+            # release 하지 않음 — 세션 유지
 
         if errors:
             error = f"촬영 실패 카메라: {errors}"
@@ -501,21 +522,162 @@ def capture_multi(dev_nums, cam_infos):
     # Multi 모드에서는 drain을 하지 않는다 (AR0234 쪽 주석 참조, 일관성 유지).
     for dev in usb_devs:
         cap, _, _, _ = _ensure_cap_open(dev, "usb")
-        t0 = time.monotonic()
-        ret = cap.grab()
-        grab_dt = (time.monotonic() - t0) * 1000
-        if ret:
+        with state.cap_lock:
             t0 = time.monotonic()
-            ret, bgr = cap.retrieve()
-            retrieve_dt = (time.monotonic() - t0) * 1000
+            ret = cap.grab()
+            grab_dt = (time.monotonic() - t0) * 1000
             if ret:
-                results[dev] = bgr
-                timing["grab_ms"] += grab_dt
-                timing["retrieve_ms"] += retrieve_dt
-                continue
+                t0 = time.monotonic()
+                ret, bgr = cap.retrieve()
+                retrieve_dt = (time.monotonic() - t0) * 1000
+                if ret:
+                    results[dev] = bgr
+                    timing["grab_ms"] += grab_dt
+                    timing["retrieve_ms"] += retrieve_dt
+                    continue
         error = (error or "") + f" cam{dev} USB 촬영 실패."
 
     return results, error, timing
+
+
+# ---------------------------------------------------------------------------
+# 라이브 스트리머 (단일 카메라)
+# ---------------------------------------------------------------------------
+
+
+class Streamer:
+    """선택된 카메라 1대에 대한 백그라운드 캡처 + JPEG 인코딩 루프.
+
+    state._open_caps 의 영속 cap 을 빌려 쓰며, 절대 release 하지 않는다.
+    grab/retrieve 는 state.cap_lock 로 직렬화해 /api/capture 와 안전하게 공존.
+    demosaic/encode 는 락 밖에서 실행해 다른 요청을 블로킹하지 않는다.
+
+    MJPEG 라우트는 wait_frame(last_seq) 으로 새 프레임이 올 때까지 블로킹하며
+    클라이언트 disconnect 와 무관하게 루프는 계속 돈다(명시적 stop() 만 종료).
+    """
+
+    def __init__(self, dev, cam_type, fps=15):
+        self._dev = dev
+        self._type = cam_type
+        self._fps = max(1, int(fps))
+
+        self._cond = threading.Condition()
+        self._running = False
+        self._thread = None
+        self._latest_jpeg = None
+        self._seq = 0
+        self._stats = collections.deque(maxlen=30)
+
+    @property
+    def dev(self):
+        return self._dev
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._loop, name=f"streamer-{self._dev}", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        with self._cond:
+            self._cond.notify_all()
+        if self._thread:
+            self._thread.join(timeout=2)
+            self._thread = None
+
+    def wait_frame(self, last_seq, timeout=1.0):
+        with self._cond:
+            if self._seq == last_seq:
+                self._cond.wait(timeout=timeout)
+            return self._seq, self._latest_jpeg
+
+    def get_stats(self):
+        with self._cond:
+            entries = list(self._stats)
+        if not entries:
+            return {"fps": 0, "grab_ms": 0, "isp_ms": 0, "encode_ms": 0}
+        n = len(entries)
+        return {
+            "fps": round(sum(e["fps"] for e in entries) / n, 1),
+            "grab_ms": round(sum(e["grab"] for e in entries) / n, 2),
+            "isp_ms": round(sum(e["isp"] for e in entries) / n, 2),
+            "encode_ms": round(sum(e["encode"] for e in entries) / n, 2),
+        }
+
+    def _loop(self):
+        # GPU demosaic 사용 시 CUDA 컨텍스트를 이 스레드에 바인딩
+        # (sync.py::_capture_loop 의 push/pop 패턴과 동일).
+        ctx = _cuda_ctx if (state.use_gpu and _cuda_ctx is not None) else None
+        if ctx is not None:
+            ctx.push()
+
+        interval = 1.0 / self._fps
+
+        try:
+            while self._running:
+                t_cycle = time.monotonic()
+
+                # grab/retrieve 는 락으로 직렬화.
+                t0 = time.monotonic()
+                ret = False
+                frame = None
+                with state.cap_lock:
+                    cap = state._open_caps.get(self._dev)
+                    info = state._cap_info.get(self._dev)
+                    if cap is None or info is None:
+                        break  # cap 이 release 된 경우 루프 종료
+                    if self._type == "ar0234" and info.get("trigger"):
+                        # 트리거 AR0234: 펄스 + 전체 동시 grab 으로 큐 동기화 유지.
+                        _sync_pulse_grab_ar0234()
+                    else:
+                        cap.grab()
+                    ret, frame = cap.retrieve()
+                t_grab = (time.monotonic() - t0) * 1000
+
+                if not ret or frame is None:
+                    # 실패 시 짧은 쉼 후 재시도 (무한 루프 방지).
+                    time.sleep(0.01)
+                    continue
+
+                # demosaic 은 락 밖에서.
+                t0 = time.monotonic()
+                if self._type == "ar0234":
+                    h, w = info["h"], info["w"]
+                    if state.use_gpu:
+                        bgr, _ = demosaic_gpu(frame, h, w, buf_id=self._dev)
+                    else:
+                        bgr = demosaic(frame, h, w)
+                else:
+                    bgr = frame
+                t_isp = (time.monotonic() - t0) * 1000
+
+                t0 = time.monotonic()
+                ok, buf = cv2.imencode(
+                    ".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                t_encode = (time.monotonic() - t0) * 1000
+                if not ok:
+                    continue
+
+                t_total = (time.monotonic() - t_cycle) * 1000
+
+                with self._cond:
+                    self._latest_jpeg = buf.tobytes()
+                    self._seq += 1
+                    self._stats.append({
+                        "grab": t_grab, "isp": t_isp, "encode": t_encode,
+                        "fps": 1000.0 / t_total if t_total > 0 else 0,
+                    })
+                    self._cond.notify_all()
+
+                # fps 캡: 남은 시간만큼 sleep.
+                elapsed = time.monotonic() - t_cycle
+                sleep_time = interval - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+        finally:
+            if ctx is not None:
+                ctx.pop()
 
 
 # ---------------------------------------------------------------------------
@@ -779,6 +941,13 @@ def api_resolution_set():
     w, h = int(data["width"]), int(data["height"])
     state._cam_res[dev] = (w, h)
 
+    # 해당 dev 스트림이 돌고 있으면 먼저 중지 (cap 을 release 하기 전에).
+    stream_stopped = False
+    if state.streamer is not None and state.streamer.dev == dev:
+        state.streamer.stop()
+        state.streamer = None
+        stream_stopped = True
+
     cap = state._open_caps.pop(dev, None)
     state._cap_info.pop(dev, None)
     if cap is not None:
@@ -796,7 +965,100 @@ def api_resolution_set():
         )
         _init_ar0234_defaults(dev)
 
-    return jsonify({"dev": dev, "width": w, "height": h})
+    return jsonify({
+        "dev": dev, "width": w, "height": h,
+        "stream_stopped": stream_stopped,
+    })
+
+
+@app.route("/api/stream/start", methods=["POST"])
+def api_stream_start():
+    """선택된 카메라 1대에 대해 백그라운드 스트리머를 시작한다.
+
+    body: {"dev": int, "fps": int(optional, default=15)}
+    """
+    data = request.get_json(force=True) or {}
+    dev = data.get("dev")
+    fps = int(data.get("fps", 15))
+    if dev is None:
+        return jsonify({"error": "dev 필요"}), 400
+
+    if state.streamer is not None:
+        # 단일-cam 스코프: 이미 돌고 있으면 같은 dev 면 OK 로 간주, 다른 dev 면 409.
+        if state.streamer.dev == dev:
+            return jsonify({"dev": dev, "fps": fps, "already": True})
+        return jsonify({"error": f"cam{state.streamer.dev} 스트림이 이미 실행 중"}), 409
+
+    cam = next((c for c in state.cameras if c["dev"] == dev), None)
+    if cam is None:
+        return jsonify({"error": f"cam{dev} 감지 안 됨"}), 400
+
+    # cap 을 미리 열어 warmup + trigger_mode 상태를 고정 (Streamer 는 이 cap 을 빌림).
+    _ensure_cap_open(dev, cam["type"])
+
+    streamer = Streamer(dev, cam["type"], fps=fps)
+    streamer.start()
+    state.streamer = streamer
+    return jsonify({"dev": dev, "fps": fps})
+
+
+@app.route("/api/stream/stop", methods=["POST"])
+def api_stream_stop():
+    """현재 활성 스트리머를 중지한다. 없으면 no-op."""
+    streamer = state.streamer
+    if streamer is None:
+        return jsonify({"stopped": False})
+    streamer.stop()
+    state.streamer = None
+    return jsonify({"stopped": True, "dev": streamer.dev})
+
+
+@app.route("/api/stream/<int:dev>/mjpeg")
+def api_stream_mjpeg(dev):
+    """해당 카메라의 라이브 MJPEG multipart 스트림.
+
+    브라우저는 <img src="/api/stream/N/mjpeg"> 으로 바로 렌더. 클라이언트
+    연결이 끊겨도 Streamer 루프는 계속 돈다 — 명시적 /api/stream/stop 만이 중지.
+    """
+    streamer = state.streamer
+    if streamer is None or streamer.dev != dev:
+        return jsonify({"error": f"cam{dev} 스트림이 시작되지 않음"}), 404
+
+    boundary = b"--frame"
+
+    def gen():
+        last_seq = 0
+        while True:
+            s = state.streamer  # 스트림이 중간에 교체/중지될 수 있음
+            if s is None or s.dev != dev:
+                return
+            seq, jpeg = s.wait_frame(last_seq, timeout=1.0)
+            if jpeg is None or seq == last_seq:
+                continue
+            last_seq = seq
+            yield (boundary + b"\r\n"
+                   b"Content-Type: image/jpeg\r\n"
+                   b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
+                   + jpeg + b"\r\n")
+
+    return Response(
+        gen(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-cache, private",
+                 "Pragma": "no-cache"},
+    )
+
+
+@app.route("/api/stream/stats", methods=["GET"])
+def api_stream_stats():
+    """활성 스트리머의 이동평균 통계 (fps, grab/isp/encode ms)."""
+    streamer = state.streamer
+    if streamer is None:
+        return jsonify({"running": False})
+    stats = streamer.get_stats()
+    stats["running"] = True
+    stats["dev"] = streamer.dev
+    return jsonify(stats)
 
 
 # ---------------------------------------------------------------------------
@@ -849,6 +1111,11 @@ HTML_TEMPLATE = """
   .btn-primary { background: #1565c0; color: #fff; }
   .btn-primary:hover { background: #1976d2; }
   .btn-primary:disabled { background: #555; cursor: not-allowed; }
+  /* Stop Stream 용: 스트리밍 중일 때 Capture 버튼이 Stop 역할을 하도록 색상만 교체.
+     .btn-capture 의 크기/웨이트는 그대로 유지돼 위계도 유지된다. */
+  .btn-danger { background: #c62828; color: #fff; }
+  .btn-danger:hover { background: #d32f2f; }
+  .btn-danger:disabled { background: #555; cursor: not-allowed; }
   /* Capture: primary 중에서도 위계를 한 단계 더 — 사용자가 가장 자주 누르는 메인 액션.
      Save 와 시각적으로 분명히 구분하려고 패딩/폰트 키움. */
   .btn-capture {
@@ -1098,6 +1365,7 @@ HTML_TEMPLATE = """
   <div class="mode-toggle">
     <label><input type="radio" name="mode" value="single" checked><span>Single</span></label>
     <label><input type="radio" name="mode" value="multi"><span>Multi</span></label>
+    <label><input type="radio" name="mode" value="stream"><span>Streaming</span></label>
   </div>
 
   <div class="trigger-status" id="trigger-status">
@@ -1108,7 +1376,7 @@ HTML_TEMPLATE = """
   </div>
 
   <div class="action-group">
-    <button class="btn btn-primary btn-capture" id="btn-capture" onclick="doCapture()">Capture</button>
+    <button class="btn btn-primary btn-capture" id="btn-capture" onclick="onMainButton()">Capture</button>
   </div>
 </div>
 
@@ -1157,6 +1425,12 @@ HTML_TEMPLATE = """
 let cameras = [];
 let hasCaptured = false;
 let busyState = false;
+
+// 스트리밍 상태. streaming=true 동안 Capture 버튼은 Stop Stream 역할을 하고,
+// cam/resolution 드롭다운은 잠긴다. statsTimer 는 /api/stream/stats 를 500ms 주기로
+// polling 하는 setInterval 핸들.
+let streaming = false;
+let statsTimer = null;
 
 // 수 초가 걸리는 작업(해상도 변경 / 카메라 재검출 / 촬영) 동안 모든 인터랙션
 // 요소(버튼·드롭다운·슬라이더·라디오·체크박스·프리셋·Close)를 비활성화하고
@@ -1235,16 +1509,38 @@ function getMode() {
 }
 
 document.querySelectorAll('input[name="mode"]').forEach(r => {
-  r.addEventListener('change', () => {
-    const multi = getMode() === 'multi';
-    document.getElementById('cam-select').style.display = multi ? 'none' : '';
-    const cb = document.getElementById('cam-checkboxes');
-    cb.classList.toggle('active', multi);
+  r.addEventListener('change', async () => {
+    // 스트리밍 중 다른 모드로 전환하려 하면 먼저 중지.
+    if (streaming && getMode() !== 'stream') {
+      await doStopStream();
+    }
+    applyModeUI();
     updateTriggerStatus();
     updateParamsPanel();
     updateResolutionDropdown();
   });
 });
+
+// 현재 모드에 맞춰 UI 를 재배치. stream 모드는 단일 카메라 전용 + Save/Clear
+// 비활성 + 메인 버튼을 Start Stream 로 표기.
+function applyModeUI() {
+  const mode = getMode();
+  const multi = mode === 'multi';
+  const stream = mode === 'stream';
+  document.getElementById('cam-select').style.display = multi ? 'none' : '';
+  document.getElementById('cam-checkboxes').classList.toggle('active', multi);
+  document.querySelector('.preview-toolbar').style.display = stream ? 'none' : '';
+  const btn = document.getElementById('btn-capture');
+  if (stream) {
+    btn.textContent = streaming ? 'Stop Stream' : 'Start Stream';
+    btn.classList.toggle('btn-danger', streaming);
+    btn.classList.toggle('btn-primary', !streaming);
+  } else {
+    btn.textContent = 'Capture';
+    btn.classList.add('btn-primary');
+    btn.classList.remove('btn-danger');
+  }
+}
 
 // --- 트리거 상태 ---
 async function updateTriggerStatus() {
@@ -1324,6 +1620,8 @@ async function loadCameras(cams) {
 
 async function refreshCameras() {
   if (busyState) return;
+  // 서버가 cap 을 release 하면서 스트리머도 stop 하므로, UI 도 미리 정리.
+  if (streaming) await doStopStream();
   setBusy(true, 'Scanning cameras...');
   try {
     const resp = await fetch('/api/cameras/refresh', { method: 'POST' });
@@ -1373,9 +1671,10 @@ function getSelectedDev() {
 }
 
 // 파라미터(exposure/gain) 적용 대상 AR0234 카메라 리스트.
-// Single 모드: 선택된 AR0234 1대, Multi 모드: 체크된 AR0234 모두.
+// Single/Stream 모드: 선택된 AR0234 1대, Multi 모드: 체크된 AR0234 모두.
 function getTargetDevsForParams() {
-  if (getMode() === 'single') {
+  const mode = getMode();
+  if (mode === 'single' || mode === 'stream') {
     const v = document.getElementById('cam-select').value;
     if (!v) return [];
     const dev = parseInt(v);
@@ -1450,9 +1749,10 @@ document.getElementById('slider-gain').addEventListener('input', function() {
 });
 
 // --- 해상도 드롭다운 ---
-// Single: 선택된 1대, Multi: 체크된 전체.
+// Single/Stream: 선택된 1대, Multi: 체크된 전체.
 function getResolutionTargets() {
-  if (getMode() === 'single') {
+  const mode = getMode();
+  if (mode === 'single' || mode === 'stream') {
     const v = document.getElementById('cam-select').value;
     return v ? [parseInt(v)] : [];
   }
@@ -1501,13 +1801,20 @@ document.getElementById('res-select').addEventListener('change', async function(
   }
   setBusy(true, 'Setting resolution ' + w + 'x' + h + '...');
   try {
-    await Promise.all(devs.map(dev =>
+    const responses = await Promise.all(devs.map(dev =>
       fetch('/api/resolution', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ dev: dev, width: w, height: h })
-      })
+      }).then(r => r.json())
     ));
+    // 서버가 스트림을 강제 중지했으면 UI 도 반영.
+    if (streaming && responses.some(r => r && r.stream_stopped)) {
+      streaming = false;
+      clearInterval(statsTimer);
+      statsTimer = null;
+      applyModeUI();
+    }
     setStatus('resolution ' + w + 'x' + h + ' (' + devs.length + ' cam, applied on next Capture)', 'ok');
   } catch (e) {
     setStatus('Resolution change failed: ' + e.message, 'error');
@@ -1538,6 +1845,16 @@ function applyPreset(exposure, gain) {
   });
   setStatus('preset: exposure=' + exposure + ' gain=' + gain +
             ' (' + devs.length + ' cam)', 'ok');
+}
+
+// --- 메인 버튼 (모드별 디스패처) ---
+// Single/Multi: Capture. Stream: Start/Stop 토글.
+function onMainButton() {
+  if (getMode() === 'stream') {
+    streaming ? doStopStream() : doStartStream();
+  } else {
+    doCapture();
+  }
 }
 
 // --- 촬영 ---
@@ -1638,6 +1955,87 @@ async function doClear() {
   document.getElementById('btn-clear').disabled = true;
   showTiming(null);
   setStatus('Preview cleared', 'info');
+}
+
+// --- 스트리밍 ---
+// 스트리밍 중에는 cam 전환과 resolution 변경을 잠근다. exposure/gain 은
+// 라이브 튜닝을 위해 열어둔다.
+function lockControls(on) {
+  document.getElementById('cam-select').disabled = on;
+  document.getElementById('res-select').disabled =
+    on || document.getElementById('res-select').options.length === 0;
+  document.getElementById('btn-refresh').disabled = on;
+}
+
+async function doStartStream() {
+  if (busyState || streaming) return;
+  const val = document.getElementById('cam-select').value;
+  if (!val) { setStatus('Select a camera first', 'error'); return; }
+  const dev = parseInt(val);
+
+  setStatus('Starting stream...', 'info');
+  try {
+    const resp = await fetch('/api/stream/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dev: dev, fps: 15 })
+    });
+    const data = await resp.json();
+    if (!resp.ok || data.error) {
+      setStatus(data.error || ('Stream start failed (' + resp.status + ')'), 'error');
+      return;
+    }
+    streaming = true;
+    const area = document.getElementById('preview-area');
+    area.className = 'preview-area single';
+    // 브라우저가 native 로 multipart/x-mixed-replace 를 렌더.
+    // cache 우회 쿼리로 이전 스트림 잔존 방지.
+    area.innerHTML =
+      '<div class="preview-card">' +
+        '<div class="card-header">cam' + dev + ' &mdash; live</div>' +
+        '<img src="/api/stream/' + dev + '/mjpeg?t=' + Date.now() + '">' +
+      '</div>';
+    applyModeUI();
+    lockControls(true);
+    statsTimer = setInterval(pollStreamStats, 500);
+    setStatus('Streaming cam' + dev, 'ok');
+  } catch (e) {
+    setStatus('Stream start failed: ' + e.message, 'error');
+  }
+}
+
+async function doStopStream() {
+  if (!streaming) return;
+  clearInterval(statsTimer);
+  statsTimer = null;
+  try {
+    await fetch('/api/stream/stop', { method: 'POST' });
+  } catch (e) {}
+  streaming = false;
+  // img 태그를 지워 브라우저의 multipart 연결도 종료.
+  const area = document.getElementById('preview-area');
+  if (getMode() === 'stream') {
+    area.innerHTML = '<div class="placeholder">Stream stopped. Press Start Stream.</div>';
+  } else {
+    area.innerHTML = '<div class="placeholder">Select a camera and press Capture</div>';
+  }
+  showTiming(null);
+  applyModeUI();
+  lockControls(false);
+  setStatus('Stream stopped', 'info');
+}
+
+async function pollStreamStats() {
+  try {
+    const resp = await fetch('/api/stream/stats');
+    const s = await resp.json();
+    if (!s.running) return;
+    // timing-bar 를 라이브 fps 위젯으로 재활용.
+    showTiming({
+      grab_ms: s.grab_ms, isp_ms: s.isp_ms, encode_ms: s.encode_ms,
+      total_ms: s.fps > 0 ? 1000.0 / s.fps : 0,
+    });
+  } catch (e) {}
 }
 
 // --- 종료 ---
