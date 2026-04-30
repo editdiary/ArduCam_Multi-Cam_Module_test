@@ -16,9 +16,9 @@ Bird's Eye View(평면 시점)로 변환하는 PoC.
 
 | Test 시나리오 | Combined BEV |
 | --- | --- |
-| `test2_leaf-hanger` — 행거 + 잎 등 비평면 객체 | ![test2](docs/sample_results/test2_leaf-hanger_bev.jpg) |
-| `test3_other-position` — 카메라 리그를 다른 위치로 옮긴 후 | ![test3](docs/sample_results/test3_other-position_bev.jpg) |
-| `test4_plane-again` — 동일 평면에서 재검증 | ![test4](docs/sample_results/test4_plane_bev.jpg) |
+| `best senarios` — Extrinsic을 계산할 때 사용한 이미지를 그대로 변환 | ![best](docs/sample_results/test1_best_combined_bev.jpg) |
+| `bad senarios` — 모형 재배단 등 비평면 객체 테스트 | ![test2](docs/sample_results/test2_leaf-hanger_bev.jpg) |
+| `plane-again` — 카메라 위치를 옮긴 후 재검증 | ![test3](docs/sample_results/test3_other-position_bev.jpg) |
 
 위 이미지는 `bev_transform.py` 의 `combined_bev.jpg` 출력. 좌/우 단독 BEV(`left_bev.jpg`, `right_bev.jpg`)도 함께 저장된다.
 
