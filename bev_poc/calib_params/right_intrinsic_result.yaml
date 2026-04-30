@@ -1,0 +1,15 @@
+%YAML:1.0
+---
+camera_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 512.7749534, 0, 953.3337961, 0, 511.7484586, 611.2312733, 0, 0, 1 ]
+dist_coeffs: !!opencv-matrix
+   rows: 1
+   cols: 4
+   dt: d
+   data: [ -0.0116278183, 0.0008489711845, -0.001945004164, 0.0001220511632 ]
+image_size: [ 1920, 1200 ]
+model: fisheye
+rms: 0.45114318

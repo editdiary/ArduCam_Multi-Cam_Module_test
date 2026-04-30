@@ -1,0 +1,106 @@
+=======================================================
+  Intrinsic Calibration Results
+=======================================================
+  Model      : fisheye
+  Board      : 10x7 inner corners  |  Square: 36.0 mm
+  Image dir  : cal_imgs/intrinsic_cal_imgs/left_cal_imgs
+
+[Image Selection]
+  Total          :  63 images
+  Used           :  55 images  (calibration OK)
+  Outlier removed:   0 images  (RMS > 5.0 px)
+  Detection fail :   8 images  (corner not found)
+      [no corner] ar0234_dev1_20260428_181939.jpg
+      [no corner] ar0234_dev1_20260428_182005.jpg
+      [no corner] ar0234_dev1_20260428_182219.jpg
+      [no corner] ar0234_dev1_20260428_182514.jpg
+      [no corner] ar0234_dev1_20260428_182606.jpg
+      [no corner] ar0234_dev1_20260428_182616.jpg
+      [no corner] ar0234_dev1_20260428_182625.jpg
+      [no corner] ar0234_dev1_20260428_182629.jpg
+
+[Camera Matrix]
+  fx =   513.2466 px    fy =   512.0300 px
+  cx =   964.3284 px    cy =   599.1082 px
+  skew = 0.000000
+
+[Distortion Coefficients]  (equidistant: k1, k2, k3, k4)
+  k1 = -0.01061073
+  k2 = -0.00345823
+  k3 = +0.00142655
+  k4 = -0.00064833
+
+[Field of View]  (equidistant)
+  Horizontal FOV = 214.34 deg
+  Vertical   FOV = 134.28 deg
+  Image size     = 1920 x 1200 px
+
+[Reprojection Error per Image]
+  Rank  Filename                         Error (px)
+  -------------------------------------------------
+     1  ar0234_dev1_20260428_182846.jpg  0.144601
+     2  ar0234_dev1_20260428_182249.jpg  0.163294
+     3  ar0234_dev1_20260428_182838.jpg  0.163653
+     4  ar0234_dev1_20260428_182402.jpg  0.167868
+     5  ar0234_dev1_20260428_182537.jpg  0.186500
+     6  ar0234_dev1_20260428_182031.jpg  0.196418
+     7  ar0234_dev1_20260428_182857.jpg  0.196466
+     8  ar0234_dev1_20260428_182508.jpg  0.202092
+     9  ar0234_dev1_20260428_182257.jpg  0.205233
+    10  ar0234_dev1_20260428_182449.jpg  0.206571
+    11  ar0234_dev1_20260428_182302.jpg  0.206879
+    12  ar0234_dev1_20260428_182956.jpg  0.209261
+    13  ar0234_dev1_20260428_182413.jpg  0.211244
+    14  ar0234_dev1_20260428_183034.jpg  0.211671
+    15  ar0234_dev1_20260428_182444.jpg  0.214842
+    16  ar0234_dev1_20260428_182356.jpg  0.216710
+    17  ar0234_dev1_20260428_182315.jpg  0.218361
+    18  ar0234_dev1_20260428_182236.jpg  0.221282
+    19  ar0234_dev1_20260428_182056.jpg  0.229786
+    20  ar0234_dev1_20260428_182407.jpg  0.237197
+    21  ar0234_dev1_20260428_182422.jpg  0.237228
+    22  ar0234_dev1_20260428_182107.jpg  0.238387
+    23  ar0234_dev1_20260428_182011.jpg  0.246089
+    24  ar0234_dev1_20260428_182227.jpg  0.246347
+    25  ar0234_dev1_20260428_182114.jpg  0.248809
+    26  ar0234_dev1_20260428_182457.jpg  0.251882
+    27  ar0234_dev1_20260428_182938.jpg  0.253062
+    28  ar0234_dev1_20260428_182051.jpg  0.253913
+    29  ar0234_dev1_20260428_182919.jpg  0.260757
+    30  ar0234_dev1_20260428_182427.jpg  0.264977
+    31  ar0234_dev1_20260428_182143.jpg  0.265115
+    32  ar0234_dev1_20260428_182902.jpg  0.266149
+    33  ar0234_dev1_20260428_182132.jpg  0.266259
+    34  ar0234_dev1_20260428_182119.jpg  0.284557
+    35  ar0234_dev1_20260428_182435.jpg  0.293731
+    36  ar0234_dev1_20260428_182946.jpg  0.296927
+    37  ar0234_dev1_20260428_182017.jpg  0.300323
+    38  ar0234_dev1_20260428_182520.jpg  0.300945
+    39  ar0234_dev1_20260428_182704.jpg  0.302783
+    40  ar0234_dev1_20260428_182037.jpg  0.312588
+    41  ar0234_dev1_20260428_182309.jpg  0.329320
+    42  ar0234_dev1_20260428_183002.jpg  0.331016
+    43  ar0234_dev1_20260428_182531.jpg  0.336875
+    44  ar0234_dev1_20260428_182324.jpg  0.342110
+    45  ar0234_dev1_20260428_183026.jpg  0.343367
+    46  ar0234_dev1_20260428_182549.jpg  0.363840
+    47  ar0234_dev1_20260428_182150.jpg  0.366195
+    48  ar0234_dev1_20260428_183007.jpg  0.389457
+    49  ar0234_dev1_20260428_182125.jpg  0.399460
+    50  ar0234_dev1_20260428_182645.jpg  0.414287
+    51  ar0234_dev1_20260428_182203.jpg  0.424316
+    52  ar0234_dev1_20260428_182212.jpg  0.455574
+    53  ar0234_dev1_20260428_182636.jpg  0.465530
+    54  ar0234_dev1_20260428_182657.jpg  0.570666
+    55  ar0234_dev1_20260428_182156.jpg  1.860698
+
+  Mean  RMS reprojection error : 0.305336 px
+  Min   RMS reprojection error : 0.144601 px
+  Max   RMS reprojection error : 1.860698 px
+  Overall RMS (cv2.calibrate)  : 0.381075 px
+
+[Saved]
+  Results saved to : cal_imgs\intrinsic_cal_imgs\left_cal_imgs\intrinsic_result.npz
+  Keys : camera_matrix, dist_coeffs, rvecs, tvecs,
+         rms, per_image_errors, image_size, used_files, model
+=======================================================

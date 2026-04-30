@@ -1,0 +1,79 @@
+(py311) PS C:\Users\henho\OneDrive\Desktop\bev_poc> python extrinsic_calibration.py --left_img cal_imgs/extrinsic_cal_imgs_2/ar0234_left_cam.jpg --right_img cal_imgs/extrinsic_cal_imgs_2/ar0234_right_cam.jpg --left_npz  cal_data/left_intrinsic_result.npz --right_npz cal_data/right_intrinsic_result.npz --origin_y -0.16 --origin_z 0.003
+
+Processing LEFT camera …
+
+=======================================================
+  Extrinsic Calibration — LEFT
+=======================================================
+  Image : ar0234_left_cam.jpg
+
+[Corner Detection]
+  Status          : OK
+  Corner ordering : flip-xy
+  Solution        : OK (physically valid)
+  Reprojection RMS: 1.033942 px
+
+[Rotation Vector]
+  rvec = [+1.595993,  -0.610048,  +0.529209]  (rad)
+
+[Rotation Matrix  R  (world → camera)]
+  [+0.752075  -0.658969  -0.011936]
+  [-0.081233  -0.074708  -0.993891]
+  [+0.654052  +0.748451  -0.109715]
+
+[Translation Vector  tvec  (world → camera, camera frame)]
+  [+0.036348,  +0.197523,  -0.034000]  (m)
+
+[Camera Pose in World]
+  Position : x=+0.0109 m  y=+0.0642 m  z=+0.1930 m  (height above ground)
+  Roll     = +98.340 deg  (x-axis tilt)
+  Pitch    = -40.848 deg  (y-axis tilt, negative = looking down)
+  Yaw      = -6.165 deg  (z-axis rotation)
+
+[4×4 Transform  T_cam_world  (world → camera)]
+  [+0.752075  -0.658969  -0.011936  +0.036348]
+  [-0.081233  -0.074708  -0.993891  +0.197523]
+  [+0.654052  +0.748451  -0.109715  -0.034000]
+  [+0.000000  +0.000000  +0.000000  +1.000000]
+=======================================================
+  Saved → cal_data\left_extrinsic_result.npz
+
+Processing RIGHT camera …
+
+=======================================================
+  Extrinsic Calibration — RIGHT
+=======================================================
+  Image : ar0234_right_cam.jpg
+
+[Corner Detection]
+  Status          : OK
+  Corner ordering : flip-xy
+  Solution        : OK (physically valid)
+  Reprojection RMS: 1.085830 px
+
+[Rotation Vector]
+  rvec = [+0.828682,  -1.790675,  +1.678067]  (rad)
+
+[Rotation Matrix  R  (world → camera)]
+  [-0.662256  -0.748965  +0.021649]
+  [-0.070180  +0.033238  -0.996980]
+  [+0.745984  -0.661775  -0.074575]
+
+[Translation Vector  tvec  (world → camera, camera frame)]
+  [-0.031628,  +0.196637,  -0.030316]  (m)
+
+[Camera Pose in World]
+  Position : x=+0.0155 m  y=-0.0503 m  z=+0.1945 m  (height above ground)
+  Roll     = -96.429 deg  (x-axis tilt)
+  Pitch    = -48.244 deg  (y-axis tilt, negative = looking down)
+  Yaw      = -173.951 deg  (z-axis rotation)
+
+[4×4 Transform  T_cam_world  (world → camera)]
+  [-0.662256  -0.748965  +0.021649  -0.031628]
+  [-0.070180  +0.033238  -0.996980  +0.196637]
+  [+0.745984  -0.661775  -0.074575  -0.030316]
+  [+0.000000  +0.000000  +0.000000  +1.000000]
+=======================================================
+  Saved → cal_data\right_extrinsic_result.npz
+
+Done.

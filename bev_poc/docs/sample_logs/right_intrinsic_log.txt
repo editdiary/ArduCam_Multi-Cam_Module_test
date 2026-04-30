@@ -1,0 +1,155 @@
+=======================================================
+  Intrinsic Calibration Results
+=======================================================
+  Model      : fisheye
+  Board      : 10x7 inner corners  |  Square: 36.0 mm
+  Image dir  : right_intrinsic_imgs_2
+
+[Image Selection]
+  Total          : 112 images
+  Used           :  51 images  (calibration OK)
+  Outlier removed:   7 images  (RMS > 2.0 px)
+  Detection fail :  54 images  (corner not found)
+      [outlier] ar0234_dev0_20260428_201833.jpg
+      [outlier] ar0234_dev0_20260428_201630.jpg
+      [outlier] ar0234_dev0_20260428_184008.jpg
+      [outlier] ar0234_dev0_20260428_184038.jpg
+      [outlier] ar0234_dev0_20260428_201410.jpg
+      [outlier] ar0234_dev0_20260428_201738.jpg
+      [outlier] ar0234_dev0_20260428_183220.jpg
+      [no corner] ar0234_dev0_20260428_183216.jpg
+      [no corner] ar0234_dev0_20260428_183258.jpg
+      [no corner] ar0234_dev0_20260428_183307.jpg
+      [no corner] ar0234_dev0_20260428_183328.jpg
+      [no corner] ar0234_dev0_20260428_183520.jpg
+      [no corner] ar0234_dev0_20260428_183532.jpg
+      [no corner] ar0234_dev0_20260428_183535.jpg
+      [no corner] ar0234_dev0_20260428_183539.jpg
+      [no corner] ar0234_dev0_20260428_183547.jpg
+      [no corner] ar0234_dev0_20260428_183551.jpg
+      [no corner] ar0234_dev0_20260428_183555.jpg
+      [no corner] ar0234_dev0_20260428_183559.jpg
+      [no corner] ar0234_dev0_20260428_183610.jpg
+      [no corner] ar0234_dev0_20260428_183618.jpg
+      [no corner] ar0234_dev0_20260428_183625.jpg
+      [no corner] ar0234_dev0_20260428_183629.jpg
+      [no corner] ar0234_dev0_20260428_183633.jpg
+      [no corner] ar0234_dev0_20260428_183642.jpg
+      [no corner] ar0234_dev0_20260428_183655.jpg
+      [no corner] ar0234_dev0_20260428_183700.jpg
+      [no corner] ar0234_dev0_20260428_183706.jpg
+      [no corner] ar0234_dev0_20260428_183711.jpg
+      [no corner] ar0234_dev0_20260428_183717.jpg
+      [no corner] ar0234_dev0_20260428_183721.jpg
+      [no corner] ar0234_dev0_20260428_183726.jpg
+      [no corner] ar0234_dev0_20260428_183731.jpg
+      [no corner] ar0234_dev0_20260428_183752.jpg
+      [no corner] ar0234_dev0_20260428_183810.jpg
+      [no corner] ar0234_dev0_20260428_183822.jpg
+      [no corner] ar0234_dev0_20260428_183828.jpg
+      [no corner] ar0234_dev0_20260428_183912.jpg
+      [no corner] ar0234_dev0_20260428_183928.jpg
+      [no corner] ar0234_dev0_20260428_183932.jpg
+      [no corner] ar0234_dev0_20260428_183936.jpg
+      [no corner] ar0234_dev0_20260428_183945.jpg
+      [no corner] ar0234_dev0_20260428_183949.jpg
+      [no corner] ar0234_dev0_20260428_184045.jpg
+      [no corner] ar0234_dev0_20260428_184051.jpg
+      [no corner] ar0234_dev0_20260428_201414.jpg
+      [no corner] ar0234_dev0_20260428_201611.jpg
+      [no corner] ar0234_dev0_20260428_201623.jpg
+      [no corner] ar0234_dev0_20260428_201626.jpg
+      [no corner] ar0234_dev0_20260428_201643.jpg
+      [no corner] ar0234_dev0_20260428_201648.jpg
+      [no corner] ar0234_dev0_20260428_201651.jpg
+      [no corner] ar0234_dev0_20260428_201655.jpg
+      [no corner] ar0234_dev0_20260428_201713.jpg
+      [no corner] ar0234_dev0_20260428_201718.jpg
+      [no corner] ar0234_dev0_20260428_201722.jpg
+      [no corner] ar0234_dev0_20260428_201728.jpg
+      [no corner] ar0234_dev0_20260428_201743.jpg
+      [no corner] ar0234_dev0_20260428_201812.jpg
+      [no corner] ar0234_dev0_20260428_201821.jpg
+      [no corner] ar0234_dev0_20260428_201827.jpg
+
+[Camera Matrix]
+  fx =   512.7750 px    fy =   511.7485 px
+  cx =   953.3338 px    cy =   611.2313 px
+  skew = 0.000000
+
+[Distortion Coefficients]  (equidistant: k1, k2, k3, k4)
+  k1 = -0.01162782
+  k2 = +0.00084897
+  k3 = -0.00194500
+  k4 = +0.00012205
+
+[Field of View]  (equidistant)
+  Horizontal FOV = 214.53 deg
+  Vertical   FOV = 134.35 deg
+  Image size     = 1920 x 1200 px
+
+[Reprojection Error per Image]
+  Rank  Filename                         Error (px)
+  -------------------------------------------------
+     1  ar0234_dev0_20260428_201619.jpg  0.186245
+     2  ar0234_dev0_20260428_201725.jpg  0.197364
+     3  ar0234_dev0_20260428_201406.jpg  0.201438
+     4  ar0234_dev0_20260428_183232.jpg  0.222835
+     5  ar0234_dev0_20260428_184028.jpg  0.235262
+     6  ar0234_dev0_20260428_183457.jpg  0.237574
+     7  ar0234_dev0_20260428_184015.jpg  0.240706
+     8  ar0234_dev0_20260428_201759.jpg  0.242161
+     9  ar0234_dev0_20260428_183953.jpg  0.243021
+    10  ar0234_dev0_20260428_201420.jpg  0.244844
+    11  ar0234_dev0_20260428_201637.jpg  0.252896
+    12  ar0234_dev0_20260428_201427.jpg  0.254124
+    13  ar0234_dev0_20260428_201634.jpg  0.254392
+    14  ar0234_dev0_20260428_183241.jpg  0.256424
+    15  ar0234_dev0_20260428_201747.jpg  0.263036
+    16  ar0234_dev0_20260428_201752.jpg  0.272600
+    17  ar0234_dev0_20260428_183524.jpg  0.272875
+    18  ar0234_dev0_20260428_183248.jpg  0.277552
+    19  ar0234_dev0_20260428_184012.jpg  0.284476
+    20  ar0234_dev0_20260428_201605.jpg  0.286652
+    21  ar0234_dev0_20260428_201732.jpg  0.289455
+    22  ar0234_dev0_20260428_201823.jpg  0.290174
+    23  ar0234_dev0_20260428_183515.jpg  0.290322
+    24  ar0234_dev0_20260428_201802.jpg  0.292739
+    25  ar0234_dev0_20260428_201707.jpg  0.294890
+    26  ar0234_dev0_20260428_201736.jpg  0.295011
+    27  ar0234_dev0_20260428_201423.jpg  0.297018
+    28  ar0234_dev0_20260428_183916.jpg  0.301514
+    29  ar0234_dev0_20260428_201817.jpg  0.314748
+    30  ar0234_dev0_20260428_183317.jpg  0.315865
+    31  ar0234_dev0_20260428_183737.jpg  0.322194
+    32  ar0234_dev0_20260428_183223.jpg  0.325487
+    33  ar0234_dev0_20260428_201809.jpg  0.331141
+    34  ar0234_dev0_20260428_201701.jpg  0.341751
+    35  ar0234_dev0_20260428_183651.jpg  0.347378
+    36  ar0234_dev0_20260428_184021.jpg  0.348077
+    37  ar0234_dev0_20260428_201601.jpg  0.354115
+    38  ar0234_dev0_20260428_183511.jpg  0.355236
+    39  ar0234_dev0_20260428_183348.jpg  0.386363
+    40  ar0234_dev0_20260428_201658.jpg  0.387630
+    41  ar0234_dev0_20260428_183505.jpg  0.403890
+    42  ar0234_dev0_20260428_183339.jpg  0.409561
+    43  ar0234_dev0_20260428_183334.jpg  0.415500
+    44  ar0234_dev0_20260428_201704.jpg  0.420405
+    45  ar0234_dev0_20260428_183801.jpg  0.422386
+    46  ar0234_dev0_20260428_201806.jpg  0.437416
+    47  ar0234_dev0_20260428_183805.jpg  0.479910
+    48  ar0234_dev0_20260428_201836.jpg  0.504448
+    49  ar0234_dev0_20260428_183815.jpg  0.510878
+    50  ar0234_dev0_20260428_201432.jpg  1.610444
+    51  ar0234_dev0_20260428_184004.jpg  1.625824
+
+  Mean  RMS reprojection error : 0.365652 px
+  Min   RMS reprojection error : 0.186245 px
+  Max   RMS reprojection error : 1.625824 px
+  Overall RMS (cv2.calibrate)  : 0.451143 px
+
+[Saved]
+  Results saved to : right_intrinsic_imgs_2\intrinsic_result.npz
+  Keys : camera_matrix, dist_coeffs, rvecs, tvecs,
+         rms, per_image_errors, image_size, used_files, model
+=======================================================

@@ -1,0 +1,20 @@
+# 캘리브레이션 / 테스트 이미지 (용량 부담, 재현은 README 참고)
+calib_imgs/
+examples/inputs/
+examples/outputs/
+
+# 개인 메모
+카메라테스트.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.cam_test/
+
+# OS
+.DS_Store
+
+# Override: README 임베드용 BEV 결과는 추적 (상위 .gitignore 의 *.jpg 우회)
+!docs/sample_results/*.jpg
